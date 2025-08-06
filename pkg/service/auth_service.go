@@ -15,7 +15,7 @@ func NewAuthServiceServer() *AuthServiceServer {
 	return &AuthServiceServer{}
 }
 
-func (s *AuthServiceServer) HealthCheck(cts context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
+func (s *AuthServiceServer) HealthCheck(ctx context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
 	return &authv1.HealthCheckResponse{
 		Status: authv1.HealthCheckResponse_SERVING,
 		Message: "Auth Server is running",

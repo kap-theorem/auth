@@ -21,7 +21,9 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcserver := grpc.NewServer()
+	grpcserver := grpc.NewServer(
+		grpc.UnaryInterceptor(unaryInterceptor),
+	)
 	authv1.RegisterAuthServiceServer(grpcserver, service.NewAuthServiceServer())
 
 	go func() {	
@@ -54,4 +56,16 @@ func main() {
 		log.Println("Shutdown timeout exceeded, forcing stop")
 		grpcserver.Stop()
 	}
+}
+
+func unaryInterceptor( ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,) (interface{}, error) {
+	start := time.Now()
+
+	log.Printf("[RPC START] Method: %s, Time: %s", info.FullMethod, start.Format(time.RFC3339))
+
+	// Call the handler to proceed with the RPC
+	resp, err := handler(ctx, req)
+
+	log.Printf("[RPC END] Method: %s, Duration: %s, Error: %v", info.FullMethod, time.Since(start), err)
+	return resp, err
 }
