@@ -7,15 +7,15 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-type AuthServiceServer struct{
+type AuthServiceServerImpl struct{
 	authv1.UnimplementedAuthServiceServer
 }
 
-func NewAuthServiceServer() *AuthServiceServer {
-	return &AuthServiceServer{}
+func NewAuthServiceServer() *AuthServiceServerImpl {
+	return &AuthServiceServerImpl{}
 }
 
-func (s *AuthServiceServer) HealthCheck(ctx context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
+func (s *AuthServiceServerImpl) HealthCheck(ctx context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
 	return &authv1.HealthCheckResponse{
 		Status: authv1.HealthCheckResponse_SERVING,
 		Message: "Auth Server is running",
