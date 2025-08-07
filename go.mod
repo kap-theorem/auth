@@ -3,6 +3,7 @@ module authservice
 go 1.23.4
 
 require (
+	github.com/joho/godotenv v1.5.1
 	google.golang.org/grpc v1.74.2
 	google.golang.org/protobuf v1.36.6
 	gorm.io/driver/mysql v1.6.0

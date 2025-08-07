@@ -2,7 +2,9 @@ package database
 
 import (
 	"log"
+	"os"
 
+	"github.com/joho/godotenv"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -13,8 +15,15 @@ type DBConnection struct {
 	*gorm.DB
 }
 
+func init() {
+	if err := godotenv.Load(); err != nil {
+		log.Println()
+	}
+}
+
 func GetDBConnection() *DBConnection {
-	connectionString := "u663533901_admin:Notkaruna@007@tcp(srv1619.hstgr.io:3306)/u663533901_auth_service?charset=utf8mb4&parseTime=True&loc=Local"
+
+	connectionString := os.Getenv("DB_CONNECTION_STRING")
 
 	db, err := gorm.Open(mysql.Open(connectionString), &gorm.Config{})
 	if err != nil {
