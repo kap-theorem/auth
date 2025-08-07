@@ -11,6 +11,7 @@ import (
 
 	"authservice/pkg/service"
 	authv1 "authservice/proto/auth/v1"
+	database "authservice/internal/database"
 
 	"google.golang.org/grpc"
 )
@@ -25,6 +26,9 @@ func main() {
 		grpc.UnaryInterceptor(unaryInterceptor),
 	)
 	authv1.RegisterAuthServiceServer(grpcserver, service.NewAuthServiceServer())
+
+	dbConnection := database.GetDBConnection()
+	dbConnection.CreateTables()
 
 	go func() {	
 		log.Println("Starting the server on: 8080")
