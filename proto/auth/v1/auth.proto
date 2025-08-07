@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package auth.v1;
+
+option go_package = "./proto/auth/v1";
+
+import "google/protobuf/empty.proto";
+
+service AuthService {
+    rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
+}
+
+message HealthCheckResponse {
+    enum Status {
+        SERVING = 0;
+        NOT_SERVING = 1;
+        SERVICE_UNKNOWN = 2;
+    }
+    Status status = 1;
+    string message = 2;
+    map<string, string> details = 3;
+}
