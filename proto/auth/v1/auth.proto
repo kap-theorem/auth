@@ -2,21 +2,38 @@ syntax = "proto3";
 
 package auth.v1;
 
+// Use module import path with package alias for Go codegen
 option go_package = "./proto/auth/v1";
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 service AuthService {
-    rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
-    rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
-    rpc LoginUser(LoginUserRequest) returns (LoginUserResponse);
-    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
-    rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
-    rpc LogoutUser(LogoutUserRequest) returns (LogoutUserResponse);
-    rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
-    rpc GetUserProfile(GetUserProfileRequest) returns (GetUserProfileResponse);
-    rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+  // Health
+  // Returns service health and optional details
+  rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
+
+  // User management
+  // Registers a new user under a client
+  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+  // Changes the password for the authenticated user (requires access_token)
+  rpc ChangeUserPassword(ChangeUserPasswordRequest) returns (ChangeUserPasswordResponse);
+
+  // Client management
+  // Registers a new client and returns its credentials
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  // Rotates a client's secret after validating the current one
+  rpc ChangeClientSecret(ChangeClientSecretRequest) returns (ChangeClientSecretResponse);
+
+  // Token management
+  // Issues access and refresh tokens for a user (aka login)
+  rpc GetToken(GetTokenRequest) returns (GetTokenResponse);
+  // Exchanges a refresh token for a new access token (and refresh token)
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
+  // Revokes a refresh token (logout)
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  // Validates an access token and returns profile info
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
 }
 
 message HealthCheckResponse {
@@ -43,20 +60,21 @@ message RegisterUserResponse {
     string user_id = 3;
 }
 
-message LoginUserRequest {
-    string email = 1;
-    string password = 2;
-    string client_id = 3;
-    string user_agent = 4;
+// Token issuance (login)
+message GetTokenRequest {
+  string email = 1;       // required
+  string password = 2;    // required
+  string client_id = 3;   // required
+  string user_agent = 4;  // optional
 }
 
-message LoginUserResponse {
-    bool success = 1;
-    string message = 2;
-    string access_token = 3;
-    string refresh_token = 4;
-    google.protobuf.Timestamp expires_at = 5;
-    UserProfile user = 6;
+message GetTokenResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
 }
 
 message ValidateTokenRequest {
@@ -68,6 +86,8 @@ message ValidateTokenResponse {
     string message = 2;
     string user_id = 3;
     google.protobuf.Timestamp expires_at = 4;
+    // Full user profile returned for convenience
+    UserProfile user = 5;
 }
 
 message RefreshTokenRequest {
@@ -83,13 +103,14 @@ message RefreshTokenResponse {
     google.protobuf.Timestamp expires_at = 5;
 }
 
-message LogoutUserRequest {
-    string refresh_token = 1;
+// Token revoke (logout)
+message RevokeTokenRequest {
+  string refresh_token = 1; // required
 }
 
-message LogoutUserResponse {
-    bool success = 1;
-    string message = 2;
+message RevokeTokenResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message RegisterClientRequest {
@@ -103,23 +124,13 @@ message RegisterClientResponse {
     string client_secret = 4;
 }
 
-message GetUserProfileRequest {
-    string access_token = 1;
-}
-
-message GetUserProfileResponse {
-    bool success = 1;
-    string message = 2;
-    UserProfile user = 3;
-}
-
-message ChangePasswordRequest {
+message ChangeUserPasswordRequest {
     string access_token = 1;
     string current_password = 2;
     string new_password = 3;
 }
 
-message ChangePasswordResponse {
+message ChangeUserPasswordResponse {
     bool success = 1;
     string message = 2;
 }
@@ -130,4 +141,18 @@ message UserProfile {
     string email = 3;
     string client_id = 4;
     google.protobuf.Timestamp created_at = 5;
+}
+
+// Client secret change
+message ChangeClientSecretRequest {
+    string client_id = 1;
+    string current_secret = 2;
+    string new_secret = 3; // if empty, server may generate a new one
+}
+
+message ChangeClientSecretResponse {
+    bool success = 1;
+    string message = 2;
+    string client_id = 3;
+    string client_secret = 4; // returned when rotated/generated
 }

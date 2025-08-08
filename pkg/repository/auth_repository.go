@@ -70,6 +70,14 @@ func (r *AuthRepository) ValidateClient(ctx context.Context, clientID, clientSec
 	return &client, nil
 }
 
+// UpdateClientSecret updates the client's secret value
+func (r *AuthRepository) UpdateClientSecret(ctx context.Context, clientID, newSecret string) error {
+	return r.db.WithContext(ctx).
+		Model(&models.Client{}).
+		Where("client_id = ?", clientID).
+		Update("client_secret", newSecret).Error
+}
+
 // Session operations
 func (r *AuthRepository) CreateOrUpdateSession(ctx context.Context, session *models.Session) error {
 	// This will either create or update based on the composite primary key (UserId + ClientId)

@@ -145,7 +145,7 @@ func TestLoginUser_Success(t *testing.T) {
 	seedClient(t, db, "client-1")
 	seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
-	resp, err := svc.LoginUser(context.Background(), &authv1.LoginUserRequest{
+	resp, err := svc.GetToken(context.Background(), &authv1.GetTokenRequest{
 		Email:     "alice@example.com",
 		Password:  "password123",
 		ClientId:  "client-1",
@@ -224,7 +224,7 @@ func TestLogoutUser_Success(t *testing.T) {
 	refresh := "refresh-to-delete"
 	seedSession(t, db, user.UserID, user.ClientID, refresh, time.Now().Add(24*time.Hour))
 
-	resp, err := svc.LogoutUser(context.Background(), &authv1.LogoutUserRequest{RefreshToken: refresh})
+	resp, err := svc.RevokeToken(context.Background(), &authv1.RevokeTokenRequest{RefreshToken: refresh})
 	if err != nil {
 		t.Fatalf("LogoutUser returned error: %v", err)
 	}
@@ -248,17 +248,21 @@ func TestGetUserProfile_Success(t *testing.T) {
 	seedClient(t, db, "client-1")
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
-	token, _, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, "any-refresh")
+	// Seed a matching session to satisfy ValidateToken's session check
+	refresh := "any-refresh"
+	seedSession(t, db, user.UserID, user.ClientID, refresh, time.Now().Add(24*time.Hour))
+
+	token, _, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, refresh)
 	if err != nil {
 		t.Fatalf("failed to generate jwt: %v", err)
 	}
 
-	resp, err := svc.GetUserProfile(context.Background(), &authv1.GetUserProfileRequest{AccessToken: token})
+	resp, err := svc.ValidateToken(context.Background(), &authv1.ValidateTokenRequest{AccessToken: token})
 	if err != nil {
-		t.Fatalf("GetUserProfile returned error: %v", err)
+		t.Fatalf("ValidateToken returned error: %v", err)
 	}
-	if !resp.Success || resp.User == nil || resp.User.UserId != user.UserID {
-		t.Fatalf("expected success with user profile, got success=%v msg=%s", resp.Success, resp.Message)
+	if !resp.Valid || resp.User == nil || resp.User.UserId != user.UserID {
+		t.Fatalf("expected valid token with user, got valid=%v", resp.Valid)
 	}
 }
 
@@ -279,7 +283,7 @@ func TestChangePassword_Success(t *testing.T) {
 		t.Fatalf("failed to generate jwt: %v", err)
 	}
 
-	resp, err := svc.ChangePassword(context.Background(), &authv1.ChangePasswordRequest{
+	resp, err := svc.ChangeUserPassword(context.Background(), &authv1.ChangeUserPasswordRequest{
 		AccessToken:     token,
 		CurrentPassword: "old-password",
 		NewPassword:     "new-password-123",
