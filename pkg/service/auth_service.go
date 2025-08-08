@@ -51,7 +51,7 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 	}
 
 	// Check if client exists
-	clientExists, err := s.repo.IsClientExists(req.ClientId)
+	clientExists, err := s.repo.IsClientExists(ctx, req.ClientId)
 	if err != nil {
 		log.Printf("Error checking client existence: %v", err)
 		return &authv1.RegisterUserResponse{
@@ -67,7 +67,7 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 	}
 
 	// Check if email already exists
-	emailExists, err := s.repo.IsEmailExists(req.Email)
+	emailExists, err := s.repo.IsEmailExists(ctx, req.Email)
 	if err != nil {
 		log.Printf("Error checking email existence: %v", err)
 		return &authv1.RegisterUserResponse{
@@ -102,7 +102,7 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 		ClientId: req.ClientId,
 	}
 
-	if err := s.repo.CreateUser(user); err != nil {
+	if err := s.repo.CreateUser(ctx, user); err != nil {
 		log.Printf("Error creating user: %v", err)
 		return &authv1.RegisterUserResponse{
 			Success: false,
@@ -130,7 +130,7 @@ func (s *AuthServiceServerImpl) LoginUser(ctx context.Context, req *authv1.Login
 	}
 
 	// Check if client exists
-	clientExists, err := s.repo.IsClientExists(req.ClientId)
+	clientExists, err := s.repo.IsClientExists(ctx, req.ClientId)
 	if err != nil {
 		log.Printf("Error checking client existence: %v", err)
 		return &authv1.LoginUserResponse{
@@ -146,7 +146,7 @@ func (s *AuthServiceServerImpl) LoginUser(ctx context.Context, req *authv1.Login
 	}
 
 	// Get user by email
-	user, err := s.repo.GetUserByEmail(req.Email)
+	user, err := s.repo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
 		log.Printf("Error getting user by email: %v", err)
 		return &authv1.LoginUserResponse{
@@ -200,7 +200,7 @@ func (s *AuthServiceServerImpl) LoginUser(ctx context.Context, req *authv1.Login
 		ExpiresAt:    time.Now().Add(7 * 24 * time.Hour), // 7 days
 	}
 
-	if err := s.repo.CreateOrUpdateSession(session); err != nil {
+	if err := s.repo.CreateOrUpdateSession(ctx, session); err != nil {
 		log.Printf("Error creating/updating session: %v", err)
 		return &authv1.LoginUserResponse{
 			Success: false,
@@ -247,7 +247,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 	}
 
 	// Check if user still exists
-	user, err := s.repo.GetUserByID(claims.UserID)
+	user, err := s.repo.GetUserByID(ctx, claims.UserID)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
 		return &authv1.ValidateTokenResponse{
@@ -275,7 +275,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 	}
 
 	// Validate refresh token exists in database (for additional security)
-	session, err := s.repo.GetSessionByUserAndClient(user.UserId, user.ClientId)
+	session, err := s.repo.GetSessionByUserAndClient(ctx, user.UserId, user.ClientId)
 	if err != nil || session.RefreshToken != claims.RefreshToken {
 		log.Printf("Refresh token validation failed")
 		return &authv1.ValidateTokenResponse{
@@ -303,7 +303,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 	}
 
 	// Get session by refresh token
-	session, err := s.repo.GetSessionByRefreshToken(req.RefreshToken)
+	session, err := s.repo.GetSessionByRefreshToken(ctx, req.RefreshToken)
 	if err != nil {
 		log.Printf("Error getting session by refresh token: %v", err)
 		return &authv1.RefreshTokenResponse{
@@ -313,7 +313,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 	}
 
 	// Get user
-	user, err := s.repo.GetUserByID(session.UserId)
+	user, err := s.repo.GetUserByID(ctx, session.UserId)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
 		return &authv1.RefreshTokenResponse{
@@ -353,7 +353,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 	// Update session with new refresh token
 	session.RefreshToken = newRefreshToken
 	session.ExpiresAt = time.Now().Add(7 * 24 * time.Hour) // 7 days
-	if err := s.repo.CreateOrUpdateSession(session); err != nil {
+	if err := s.repo.CreateOrUpdateSession(ctx, session); err != nil {
 		log.Printf("Error updating session: %v", err)
 		return &authv1.RefreshTokenResponse{
 			Success: false,
@@ -382,7 +382,7 @@ func (s *AuthServiceServerImpl) LogoutUser(ctx context.Context, req *authv1.Logo
 	}
 
 	// Delete session by refresh token
-	if err := s.repo.DeleteSessionByRefreshToken(req.RefreshToken); err != nil {
+	if err := s.repo.DeleteSessionByRefreshToken(ctx, req.RefreshToken); err != nil {
 		log.Printf("Error deleting session: %v", err)
 		return &authv1.LogoutUserResponse{
 			Success: false,
@@ -425,7 +425,7 @@ func (s *AuthServiceServerImpl) RegisterClient(ctx context.Context, req *authv1.
 		ClientSecret: clientSecret,
 	}
 
-	if err := s.repo.CreateClient(client); err != nil {
+	if err := s.repo.CreateClient(ctx, client); err != nil {
 		log.Printf("Error creating client: %v", err)
 		return &authv1.RegisterClientResponse{
 			Success: false,
@@ -461,7 +461,7 @@ func (s *AuthServiceServerImpl) GetUserProfile(ctx context.Context, req *authv1.
 		}, nil
 	}
 
-	user, err := s.repo.GetUserByID(claims.UserID)
+	user, err := s.repo.GetUserByID(ctx, claims.UserID)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
 		return &authv1.GetUserProfileResponse{
@@ -506,7 +506,7 @@ func (s *AuthServiceServerImpl) ChangePassword(ctx context.Context, req *authv1.
 	}
 
 	// Get user
-	user, err := s.repo.GetUserByID(claims.UserID)
+	user, err := s.repo.GetUserByID(ctx, claims.UserID)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
 		return &authv1.ChangePasswordResponse{
@@ -535,7 +535,7 @@ func (s *AuthServiceServerImpl) ChangePassword(ctx context.Context, req *authv1.
 
 	// Update password
 	user.Password = hashedNewPassword
-	if err := s.repo.UpdateUser(user); err != nil {
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
 		log.Printf("Error updating user password: %v", err)
 		return &authv1.ChangePasswordResponse{
 			Success: false,
@@ -544,7 +544,7 @@ func (s *AuthServiceServerImpl) ChangePassword(ctx context.Context, req *authv1.
 	}
 
 	// Invalidate all sessions for this user (security requirement)
-	if err := s.repo.DeleteAllUserSessions(user.UserId); err != nil {
+	if err := s.repo.DeleteAllUserSessions(ctx, user.UserId); err != nil {
 		log.Printf("Error invalidating user sessions: %v", err)
 		return &authv1.ChangePasswordResponse{
 			Success: false,

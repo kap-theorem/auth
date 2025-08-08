@@ -3,10 +3,14 @@ package database
 import (
 	"log"
 	"os"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/joho/godotenv"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	models "authservice/pkg/models"
 )
@@ -15,6 +19,11 @@ type DBConnection struct {
 	*gorm.DB
 }
 
+var (
+	once      sync.Once
+	singleton *DBConnection
+)
+
 func init() {
 	if err := godotenv.Load(); err != nil {
 		log.Println()
@@ -22,17 +31,72 @@ func init() {
 }
 
 func GetDBConnection() *DBConnection {
+	once.Do(func() {
+		connectionString := os.Getenv("DB_CONNECTION_STRING")
+		if connectionString == "" {
+			log.Fatal("DB_CONNECTION_STRING is not set")
+		}
 
-	connectionString := os.Getenv("DB_CONNECTION_STRING")
+		gormConfig := &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Warn),
+		}
 
-	db, err := gorm.Open(mysql.Open(connectionString), &gorm.Config{})
+		db, err := gorm.Open(mysql.Open(connectionString), gormConfig)
+		if err != nil {
+			log.Fatalf("Failed to connect to database: %v", err)
+		}
+
+		// Configure database pool
+		sqlDB, err := db.DB()
+		if err != nil {
+			log.Fatalf("Failed to access underlying sql.DB: %v", err)
+		}
+
+		// Defaults with sane values; can be overridden by env
+		maxOpen := getEnvInt("DB_MAX_OPEN_CONNS", 30)
+		maxIdle := getEnvInt("DB_MAX_IDLE_CONNS", 15)
+		maxLifetimeMin := getEnvInt("DB_CONN_MAX_LIFETIME_MIN", 55)
+		maxIdleTimeMin := getEnvInt("DB_CONN_MAX_IDLE_TIME_MIN", 5)
+
+		sqlDB.SetMaxOpenConns(maxOpen)
+		sqlDB.SetMaxIdleConns(maxIdle)
+		sqlDB.SetConnMaxLifetime(time.Duration(maxLifetimeMin) * time.Minute)
+		sqlDB.SetConnMaxIdleTime(time.Duration(maxIdleTimeMin) * time.Minute)
+
+		// Validate the connection early
+		if err := sqlDB.Ping(); err != nil {
+			log.Fatalf("Database ping failed: %v", err)
+		}
+
+		singleton = &DBConnection{db}
+	})
+
+	return singleton
+}
+
+// Close releases the underlying sql.DB. Should be called on graceful shutdown.
+func (dbCon *DBConnection) Close() {
+	if dbCon == nil || dbCon.DB == nil {
+		return
+	}
+	sqlDB, err := dbCon.DB.DB()
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Printf("Warning: unable to retrieve sql.DB for close: %v", err)
+		return
 	}
+	if err := sqlDB.Close(); err != nil {
+		log.Printf("Warning: error closing database: %v", err)
+	}
+}
 
-	return &DBConnection{
-		db,
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+		log.Printf("Invalid int for %s=%q, using default %d", key, v, fallback)
 	}
+	return fallback
 }
 
 func (dbCon *DBConnection) CreateTables() {
