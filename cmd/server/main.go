@@ -9,11 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	database "authservice/internal/database"
 	"authservice/pkg/service"
 	authv1 "authservice/proto/auth/v1"
-	database "authservice/internal/database"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 func main() {
@@ -22,15 +23,22 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	grpcserver := grpc.NewServer(
-		grpc.UnaryInterceptor(unaryInterceptor),
-	)
-	authv1.RegisterAuthServiceServer(grpcserver, service.NewAuthServiceServer())
-
 	dbConnection := database.GetDBConnection()
 	dbConnection.CreateTables()
 
-	go func() {	
+	// Start cleanup service in background
+	cleanupService := service.NewCleanupService(dbConnection.DB)
+	go cleanupService.StartCleanupJob()
+
+	grpcserver := grpc.NewServer(
+		grpc.UnaryInterceptor(unaryInterceptor),
+	)
+	authv1.RegisterAuthServiceServer(grpcserver, service.NewAuthServiceServer(dbConnection.DB))
+
+	// Enable reflection for grpcurl
+	reflection.Register(grpcserver)
+
+	go func() {
 		log.Println("Starting the server on: 8080")
 		if err := grpcserver.Serve(listen); err != nil {
 			log.Fatalf("Failed to start server")
@@ -43,7 +51,7 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down server")
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -62,7 +70,7 @@ func main() {
 	}
 }
 
-func unaryInterceptor( ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,) (interface{}, error) {
+func unaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	start := time.Now()
 
 	log.Printf("[RPC START] Method: %s, Time: %s", info.FullMethod, start.Format(time.RFC3339))
