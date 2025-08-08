@@ -33,7 +33,7 @@ func seedClient(t *testing.T, db *gorm.DB, clientID string) {
 	t.Helper()
 	repo := repository.NewAuthRepository(db)
 	if err := repo.CreateClient(context.Background(), &models.Client{
-		ClientId:     clientID,
+		ClientID:     clientID,
 		ClientName:   "test-client",
 		ClientSecret: "secret",
 	}); err != nil {
@@ -49,11 +49,11 @@ func seedUser(t *testing.T, db *gorm.DB, userID, clientID, email, username, rawP
 		t.Fatalf("failed to hash password: %v", err)
 	}
 	user := &models.User{
-		UserId:   userID,
+		UserID:   userID,
 		UserName: username,
-		EmailId:  email,
+		Email:    email,
 		Password: hashed,
-		ClientId: clientID,
+		ClientID: clientID,
 	}
 	if err := repo.CreateUser(context.Background(), user); err != nil {
 		t.Fatalf("failed to seed user: %v", err)
@@ -65,8 +65,8 @@ func seedSession(t *testing.T, db *gorm.DB, userID, clientID, refreshToken strin
 	t.Helper()
 	repo := repository.NewAuthRepository(db)
 	if err := repo.CreateOrUpdateSession(context.Background(), &models.Session{
-		UserId:       userID,
-		ClientId:     clientID,
+		UserID:       userID,
+		ClientID:     clientID,
 		RefreshToken: refreshToken,
 		UserAgent:    "test-agent",
 		ExpiresAt:    expiresAt,
@@ -175,9 +175,9 @@ func TestValidateToken_Success(t *testing.T) {
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
 	refresh := "refresh-abc"
-	seedSession(t, db, user.UserId, user.ClientId, refresh, time.Now().Add(24*time.Hour))
+	seedSession(t, db, user.UserID, user.ClientID, refresh, time.Now().Add(24*time.Hour))
 
-	token, _, err := utils.GenerateJWTToken(user.UserId, user.UserName, user.ClientId, refresh)
+	token, _, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, refresh)
 	if err != nil {
 		t.Fatalf("failed to generate jwt: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestValidateToken_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ValidateToken returned error: %v", err)
 	}
-	if !resp.Valid || resp.UserId != user.UserId {
+	if !resp.Valid || resp.UserId != user.UserID {
 		t.Fatalf("expected valid token for user, got valid=%v user_id=%s msg=%s", resp.Valid, resp.UserId, resp.Message)
 	}
 }
@@ -201,11 +201,11 @@ func TestRefreshToken_Success(t *testing.T) {
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
 	oldRefresh := "refresh-old"
-	seedSession(t, db, user.UserId, user.ClientId, oldRefresh, time.Now().Add(24*time.Hour))
+	seedSession(t, db, user.UserID, user.ClientID, oldRefresh, time.Now().Add(24*time.Hour))
 
 	resp, err := svc.RefreshToken(context.Background(), &authv1.RefreshTokenRequest{
 		RefreshToken: oldRefresh,
-		ClientId:     user.ClientId,
+		ClientId:     user.ClientID,
 	})
 	if err != nil {
 		t.Fatalf("RefreshToken returned error: %v", err)
@@ -222,7 +222,7 @@ func TestLogoutUser_Success(t *testing.T) {
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
 	refresh := "refresh-to-delete"
-	seedSession(t, db, user.UserId, user.ClientId, refresh, time.Now().Add(24*time.Hour))
+	seedSession(t, db, user.UserID, user.ClientID, refresh, time.Now().Add(24*time.Hour))
 
 	resp, err := svc.LogoutUser(context.Background(), &authv1.LogoutUserRequest{RefreshToken: refresh})
 	if err != nil {
@@ -248,7 +248,7 @@ func TestGetUserProfile_Success(t *testing.T) {
 	seedClient(t, db, "client-1")
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "password123")
 
-	token, _, err := utils.GenerateJWTToken(user.UserId, user.UserName, user.ClientId, "any-refresh")
+	token, _, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, "any-refresh")
 	if err != nil {
 		t.Fatalf("failed to generate jwt: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestGetUserProfile_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetUserProfile returned error: %v", err)
 	}
-	if !resp.Success || resp.User == nil || resp.User.UserId != user.UserId {
+	if !resp.Success || resp.User == nil || resp.User.UserId != user.UserID {
 		t.Fatalf("expected success with user profile, got success=%v msg=%s", resp.Success, resp.Message)
 	}
 }
@@ -272,9 +272,9 @@ func TestChangePassword_Success(t *testing.T) {
 	user := seedUser(t, db, "user-1", "client-1", "alice@example.com", "alice", "old-password")
 
 	// seed a session that should be invalidated
-	seedSession(t, db, user.UserId, user.ClientId, "refresh-to-be-removed", time.Now().Add(24*time.Hour))
+	seedSession(t, db, user.UserID, user.ClientID, "refresh-to-be-removed", time.Now().Add(24*time.Hour))
 
-	token, _, err := utils.GenerateJWTToken(user.UserId, user.UserName, user.ClientId, "refresh-to-be-removed")
+	token, _, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, "refresh-to-be-removed")
 	if err != nil {
 		t.Fatalf("failed to generate jwt: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestChangePassword_Success(t *testing.T) {
 
 	// ensure sessions invalidated
 	repo := repository.NewAuthRepository(db)
-	if _, err := repo.GetSessionByUserAndClient(context.Background(), user.UserId, user.ClientId); err == nil {
+	if _, err := repo.GetSessionByUserAndClient(context.Background(), user.UserID, user.ClientID); err == nil {
 		t.Fatalf("expected user sessions to be deleted")
 	}
 }
