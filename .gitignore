@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 
 proto/auth/v1/*.pb.go
+
+server
+auth-server

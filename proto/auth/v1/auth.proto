@@ -5,9 +5,18 @@ package auth.v1;
 option go_package = "./proto/auth/v1";
 
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 service AuthService {
     rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
+    rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+    rpc LoginUser(LoginUserRequest) returns (LoginUserResponse);
+    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+    rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
+    rpc LogoutUser(LogoutUserRequest) returns (LogoutUserResponse);
+    rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+    rpc GetUserProfile(GetUserProfileRequest) returns (GetUserProfileResponse);
+    rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
 }
 
 message HealthCheckResponse {
@@ -19,4 +28,106 @@ message HealthCheckResponse {
     Status status = 1;
     string message = 2;
     map<string, string> details = 3;
+}
+
+message RegisterUserRequest {
+    string username = 1;
+    string email = 2;
+    string password = 3;
+    string client_id = 4;
+}
+
+message RegisterUserResponse {
+    bool success = 1;
+    string message = 2;
+    string user_id = 3;
+}
+
+message LoginUserRequest {
+    string email = 1;
+    string password = 2;
+    string client_id = 3;
+    string user_agent = 4;
+}
+
+message LoginUserResponse {
+    bool success = 1;
+    string message = 2;
+    string access_token = 3;
+    string refresh_token = 4;
+    google.protobuf.Timestamp expires_at = 5;
+    UserProfile user = 6;
+}
+
+message ValidateTokenRequest {
+    string access_token = 1;
+}
+
+message ValidateTokenResponse {
+    bool valid = 1;
+    string message = 2;
+    string user_id = 3;
+    google.protobuf.Timestamp expires_at = 4;
+}
+
+message RefreshTokenRequest {
+    string refresh_token = 1;
+    string client_id = 2;
+}
+
+message RefreshTokenResponse {
+    bool success = 1;
+    string message = 2;
+    string access_token = 3;
+    string refresh_token = 4;
+    google.protobuf.Timestamp expires_at = 5;
+}
+
+message LogoutUserRequest {
+    string refresh_token = 1;
+}
+
+message LogoutUserResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message RegisterClientRequest {
+    string client_name = 1;
+}
+
+message RegisterClientResponse {
+    bool success = 1;
+    string message = 2;
+    string client_id = 3;
+    string client_secret = 4;
+}
+
+message GetUserProfileRequest {
+    string access_token = 1;
+}
+
+message GetUserProfileResponse {
+    bool success = 1;
+    string message = 2;
+    UserProfile user = 3;
+}
+
+message ChangePasswordRequest {
+    string access_token = 1;
+    string current_password = 2;
+    string new_password = 3;
+}
+
+message ChangePasswordResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message UserProfile {
+    string user_id = 1;
+    string username = 2;
+    string email = 3;
+    string client_id = 4;
+    google.protobuf.Timestamp created_at = 5;
 }
