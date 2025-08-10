@@ -28,7 +28,7 @@ func main() {
 
 	// Start cleanup service in background
 	cleanupService := service.NewCleanupService(dbConnection.DB)
-	go cleanupService.StartCleanupJob()
+	cleanupService.Start()
 
 	grpcserver := grpc.NewServer(
 		grpc.UnaryInterceptor(unaryInterceptor),
@@ -68,6 +68,12 @@ func main() {
 		log.Println("Shutdown timeout exceeded, forcing stop")
 		grpcserver.Stop()
 	}
+
+	// Stop background jobs
+	cleanupService.Stop()
+
+	// Close database after gRPC server stops accepting new connections
+	dbConnection.Close()
 }
 
 func unaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
