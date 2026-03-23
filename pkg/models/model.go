@@ -40,10 +40,30 @@ type Session struct {
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
+type PasswordResetToken struct {
+	Token     string    `gorm:"primaryKey;size:64" json:"token"`
+	UserID    string    `gorm:"column:user_id;size:36;not null;index" json:"user_id"`
+	ClientID  string    `gorm:"column:client_id;size:36;not null" json:"client_id"`
+	ExpiresAt time.Time `gorm:"not null" json:"expires_at"`
+	Used      bool      `gorm:"default:false" json:"used"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+}
+
+type InviteToken struct {
+	Token     string    `gorm:"primaryKey;size:64" json:"token"`
+	ClientID  string    `gorm:"column:client_id;size:36;not null;index" json:"client_id"`
+	Email     string    `gorm:"size:255" json:"email"` // optional pre-filled email
+	Used      bool      `gorm:"default:false" json:"used"`
+	ExpiresAt time.Time `gorm:"not null" json:"expires_at"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+}
+
 func GetAllModels() []any {
 	return []any{
-		&Client{},  // Create clients table first (parent)
-		&User{},    // Then users table (references clients)
-		&Session{}, // Finally sessions table (references both users and clients)
+		&Client{},             // Create clients table first (parent)
+		&User{},               // Then users table (references clients)
+		&Session{},            // Finally sessions table (references both users and clients)
+		&PasswordResetToken{}, // Password reset tokens
+		&InviteToken{},        // Invite tokens
 	}
 }

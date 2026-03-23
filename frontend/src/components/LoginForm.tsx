@@ -52,11 +52,38 @@ export default function LoginForm({
                 const isIframe = window.self !== window.top;
 
                 if (isIframe) {
-                    // Notify parent window of success
+                    // Derive parent origin from redirectUrl (e.g. https://wordskali.kaplabs.dev/callback)
+                    // so postMessage targets the correct cross-origin parent window
+                    let targetOrigin = '*';
+                    try {
+                        if (redirectUrl.startsWith('http')) {
+                            targetOrigin = new URL(redirectUrl).origin;
+                        }
+                    } catch {}
                     window.parent.postMessage({
                         type: 'AUTH_SUCCESS',
                         access_token: data.access_token,
-                    }, document.referrer || window.location.origin);
+                    }, targetOrigin);
+
+                    // Fallback: if redirectUrl is an absolute URL, submit a hidden form
+                    // with target="_top" so the parent window navigates even if
+                    // postMessage is blocked by browser third-party context policies.
+                    if (redirectUrl.startsWith('http')) {
+                        const form = document.createElement('form');
+                        form.method = 'POST';
+                        form.action = redirectUrl;
+                        form.target = '_top';
+
+                        const tokenInput = document.createElement('input');
+                        tokenInput.type = 'hidden';
+                        tokenInput.name = 'token';
+                        tokenInput.value = data.access_token;
+                        form.appendChild(tokenInput);
+
+                        document.body.appendChild(form);
+                        form.submit();
+                        return; // prevent setLoading(false)
+                    }
                 } else {
                     // Normal redirect flow
                     if (redirectUrl.startsWith("http")) {
@@ -85,7 +112,7 @@ export default function LoginForm({
         // Since the demo user is 'demo', use 'demo' as the identifier for demo login type 'both' or 'username'
         // Fallback to email for type 'email' only
         const demoIdent = loginType === "email" ? "demo@kaplabs.dev" : "demo";
-        await performLogin(demoIdent, "demo");
+        await performLogin(demoIdent, "demodemo");
     };
 
     let labelText = "Email Address";

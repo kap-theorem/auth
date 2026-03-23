@@ -120,7 +120,7 @@ func (r *AuthRepository) CreateOrUpdateSession(ctx context.Context, session *mod
 	// We use OnConflict to avoid updating the created_at field with zero values
 	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "user_id"}, {Name: "client_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"refresh_token", "user_agent", "expires_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"refresh_token", "user_agent", "expires_at", "updated_at", "deleted_at"}),
 	}).Create(session).Error
 }
 
@@ -213,4 +213,57 @@ func (r *AuthRepository) GetClientStats(ctx context.Context, clientID string) (t
 	last24h := time.Now().Add(-24 * time.Hour)
 	err = r.db.WithContext(ctx).Model(&models.Session{}).Where("client_id = ? AND created_at > ?", clientID, last24h).Count(&last24hLogins).Error
 	return
+}
+
+// Password Reset Token operations
+func (r *AuthRepository) CreatePasswordResetToken(ctx context.Context, token *models.PasswordResetToken) error {
+	return r.db.WithContext(ctx).Create(token).Error
+}
+
+func (r *AuthRepository) GetPasswordResetToken(ctx context.Context, token string) (*models.PasswordResetToken, error) {
+	var resetToken models.PasswordResetToken
+	err := r.db.WithContext(ctx).Where("token = ? AND used = ? AND expires_at > ?", token, false, time.Now()).First(&resetToken).Error
+	if err != nil {
+		return nil, err
+	}
+	return &resetToken, nil
+}
+
+func (r *AuthRepository) MarkPasswordResetTokenUsed(ctx context.Context, token string) error {
+	return r.db.WithContext(ctx).Model(&models.PasswordResetToken{}).Where("token = ?", token).Update("used", true).Error
+}
+
+func (r *AuthRepository) DeleteExpiredPasswordResetTokens(ctx context.Context) error {
+	return r.db.WithContext(ctx).Delete(&models.PasswordResetToken{}, "expires_at < ? OR used = ?", time.Now(), true).Error
+}
+
+// Count active sessions for a user (excluding a specific refresh token)
+func (r *AuthRepository) CountUserSessions(ctx context.Context, userID string) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Session{}).Where("user_id = ? AND expires_at > ?", userID, time.Now()).Count(&count).Error
+	return count, err
+}
+
+// Delete all sessions except the one with the given refresh token
+func (r *AuthRepository) DeleteOtherUserSessions(ctx context.Context, userID string, keepRefreshToken string) (int64, error) {
+	result := r.db.WithContext(ctx).Where("user_id = ? AND refresh_token != ?", userID, keepRefreshToken).Delete(&models.Session{})
+	return result.RowsAffected, result.Error
+}
+
+// Invite Token operations
+func (r *AuthRepository) CreateInviteToken(ctx context.Context, token *models.InviteToken) error {
+	return r.db.WithContext(ctx).Create(token).Error
+}
+
+func (r *AuthRepository) GetInviteToken(ctx context.Context, token string) (*models.InviteToken, error) {
+	var inviteToken models.InviteToken
+	err := r.db.WithContext(ctx).Where("token = ? AND used = ? AND expires_at > ?", token, false, time.Now()).First(&inviteToken).Error
+	if err != nil {
+		return nil, err
+	}
+	return &inviteToken, nil
+}
+
+func (r *AuthRepository) MarkInviteTokenUsed(ctx context.Context, token string) error {
+	return r.db.WithContext(ctx).Model(&models.InviteToken{}).Where("token = ?", token).Update("used", true).Error
 }

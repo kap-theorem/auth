@@ -77,12 +77,30 @@ export default function ClientUsersPage() {
         setInviteLink('');
     };
 
-    const generateInviteLink = () => {
-        const base = `${window.location.origin}/client/${clientId}/user/register`;
-        const link = form.email
-            ? `${base}?invite=1&email=${encodeURIComponent(form.email)}`
-            : `${base}?invite=1`;
-        setInviteLink(link);
+    const [inviteLoading, setInviteLoading] = useState(false);
+
+    const generateInviteLink = async () => {
+        setInviteLoading(true);
+        try {
+            const res = await fetch(`/api/client/${clientId}/invite`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: form.email || '' }),
+            });
+            const data = await res.json();
+            if (data.success && data.inviteToken) {
+                const base = `${window.location.origin}/client/${clientId}/user/register`;
+                const params = new URLSearchParams({ invite_token: data.inviteToken });
+                if (form.email) params.set('email', form.email);
+                setInviteLink(`${base}?${params.toString()}`);
+            } else {
+                setFormError(data.message || 'Failed to generate invite token');
+            }
+        } catch {
+            setFormError('Failed to generate invite token');
+        } finally {
+            setInviteLoading(false);
+        }
     };
 
     const copyInvite = () => {
@@ -292,9 +310,10 @@ export default function ClientUsersPage() {
                                     <button
                                         type="button"
                                         onClick={generateInviteLink}
-                                        className="w-full py-3 rounded-xl font-bold text-sm bg-indigo-600 text-white hover:bg-indigo-500 transition-colors"
+                                        disabled={inviteLoading}
+                                        className="w-full py-3 rounded-xl font-bold text-sm bg-indigo-600 text-white hover:bg-indigo-500 transition-colors disabled:opacity-60"
                                     >
-                                        Generate Link
+                                        {inviteLoading ? 'Generating...' : 'Generate Link'}
                                     </button>
 
                                     {inviteLink && (

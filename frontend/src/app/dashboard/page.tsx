@@ -90,10 +90,10 @@ export default function UserDashboard() {
                             Security Controls
                         </h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <button className="p-4 bg-zinc-50 dark:bg-white/5 border border-zinc-100 dark:border-white/5 rounded-2xl text-left hover:border-indigo-500/50 transition-all group">
+                            <a href={`/client/${profile.clientId}/user/profile`} className="p-4 bg-zinc-50 dark:bg-white/5 border border-zinc-100 dark:border-white/5 rounded-2xl text-left hover:border-indigo-500/50 transition-all group block">
                                 <p className="font-bold text-black dark:text-white group-hover:text-indigo-500 transition-colors">Rotate Password</p>
                                 <p className="text-xs text-zinc-500 mt-1">Recommended every 90 days</p>
-                            </button>
+                            </a>
                             <button className="p-4 bg-zinc-50 dark:bg-white/5 border border-zinc-100 dark:border-white/5 rounded-2xl text-left hover:border-indigo-500/50 transition-all group">
                                 <p className="font-bold text-black dark:text-white group-hover:text-indigo-500 transition-colors">Enable Two-Factor</p>
                                 <p className="text-xs text-zinc-500 mt-1">Add an extra layer of protection</p>
@@ -124,7 +124,19 @@ export default function UserDashboard() {
                             <SessionItem device="Chrome on MacOS" location="San Francisco, US" current />
                             <SessionItem device="Safari on iPhone" location="San Francisco, US" />
                         </div>
-                        <button className="w-full mt-8 py-3 text-red-500 font-bold text-sm bg-red-500/5 rounded-2xl hover:bg-red-500/10 transition-colors">
+                        <button
+                            onClick={async () => {
+                                if (!confirm("Revoke all other sessions? You will remain logged in on this device only.")) return;
+                                try {
+                                    const res = await fetch("/api/auth/revoke-sessions", { method: "POST" });
+                                    const data = await res.json();
+                                    alert(data.message || (data.success ? "Sessions revoked" : "Failed"));
+                                } catch {
+                                    alert("Failed to revoke sessions");
+                                }
+                            }}
+                            className="w-full mt-8 py-3 text-red-500 font-bold text-sm bg-red-500/5 rounded-2xl hover:bg-red-500/10 transition-colors"
+                        >
                             Revoke All Other Sessions
                         </button>
                     </div>

@@ -52,7 +52,9 @@ export function getAuthClient() {
 
         clientInstance = new authPackage.AuthService(
             GRPC_SERVER_URL,
-            grpc.credentials.createInsecure()
+            process.env.GRPC_USE_TLS === 'true'
+                ? grpc.credentials.createSsl()
+                : grpc.credentials.createInsecure()
         );
     } catch (err: any) {
         console.error('[gRPC] CRITICAL FAILURE during proto load:', err);

@@ -6,6 +6,8 @@ import (
 	"authservice/pkg/utils"
 	authv1 "authservice/proto/auth/v1"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"regexp"
@@ -65,6 +67,48 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 			Success: false,
 			Message: "Invalid client ID",
 		}, nil
+	}
+
+	// Check if client is invite-only and validate invite token
+	clientConfig, err := s.repo.GetClientConfig(ctx, req.ClientId)
+	if err != nil {
+		log.Printf("Error getting client config: %v", err)
+		return &authv1.RegisterUserResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+	if clientConfig.InviteOnly {
+		if req.InviteToken == "" {
+			return &authv1.RegisterUserResponse{
+				Success: false,
+				Message: "This application requires an invite token to register",
+			}, nil
+		}
+		inviteToken, err := s.repo.GetInviteToken(ctx, req.InviteToken)
+		if err != nil {
+			return &authv1.RegisterUserResponse{
+				Success: false,
+				Message: "Invalid or expired invite token",
+			}, nil
+		}
+		if inviteToken.ClientID != req.ClientId {
+			return &authv1.RegisterUserResponse{
+				Success: false,
+				Message: "Invite token is not valid for this application",
+			}, nil
+		}
+		// If invite token has a pre-filled email, verify it matches
+		if inviteToken.Email != "" && inviteToken.Email != req.Email {
+			return &authv1.RegisterUserResponse{
+				Success: false,
+				Message: "Email does not match the invite",
+			}, nil
+		}
+		// Mark token as used after all validation passes (we'll do this after user creation)
+		defer func() {
+			_ = s.repo.MarkInviteTokenUsed(ctx, req.InviteToken)
+		}()
 	}
 
 	// Check if email already exists
@@ -886,6 +930,59 @@ func (s *AuthServiceServerImpl) UpdateClientUser(ctx context.Context, req *authv
 	return &authv1.UpdateClientUserResponse{Success: true, Message: "User updated successfully"}, nil
 }
 
+func (s *AuthServiceServerImpl) CreateInviteToken(ctx context.Context, req *authv1.CreateInviteTokenRequest) (*authv1.CreateInviteTokenResponse, error) {
+	log.Printf("CreateInviteToken request received for client: %s", req.ClientId)
+
+	if req.ClientId == "" {
+		return &authv1.CreateInviteTokenResponse{
+			Success: false,
+			Message: "Client ID is required",
+		}, nil
+	}
+
+	// Verify client exists
+	exists, err := s.repo.IsClientExists(ctx, req.ClientId)
+	if err != nil || !exists {
+		return &authv1.CreateInviteTokenResponse{
+			Success: false,
+			Message: "Invalid client ID",
+		}, nil
+	}
+
+	// Generate token
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Printf("Error generating invite token: %v", err)
+		return &authv1.CreateInviteTokenResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+	tokenStr := hex.EncodeToString(tokenBytes)
+
+	inviteToken := &models.InviteToken{
+		Token:     tokenStr,
+		ClientID:  req.ClientId,
+		Email:     req.Email,
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour), // 7 days
+	}
+
+	if err := s.repo.CreateInviteToken(ctx, inviteToken); err != nil {
+		log.Printf("Error creating invite token: %v", err)
+		return &authv1.CreateInviteTokenResponse{
+			Success: false,
+			Message: "Failed to create invite token",
+		}, nil
+	}
+
+	log.Printf("Invite token created for client: %s", req.ClientId)
+	return &authv1.CreateInviteTokenResponse{
+		Success:     true,
+		Message:     "Invite token created successfully. Valid for 7 days.",
+		InviteToken: tokenStr,
+	}, nil
+}
+
 func (s *AuthServiceServerImpl) GetClientConfig(ctx context.Context, req *authv1.GetClientConfigRequest) (*authv1.GetClientConfigResponse, error) {
 	client, err := s.repo.GetClientConfig(ctx, req.ClientId)
 	if err != nil {
@@ -920,6 +1017,165 @@ func (s *AuthServiceServerImpl) UpdateClientConfig(ctx context.Context, req *aut
 		Success: true,
 		Message: "Configuration updated",
 		Config:  req.Config,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) RequestPasswordReset(ctx context.Context, req *authv1.RequestPasswordResetRequest) (*authv1.RequestPasswordResetResponse, error) {
+	log.Printf("RequestPasswordReset request received for email: %s", req.Email)
+
+	if req.Email == "" || req.ClientId == "" {
+		return &authv1.RequestPasswordResetResponse{
+			Success: false,
+			Message: "Email and client ID are required",
+		}, nil
+	}
+
+	// Check if user exists with this email under this client
+	user, err := s.repo.GetUserByEmail(ctx, req.Email)
+	if err != nil || user.ClientID != req.ClientId {
+		// Don't reveal whether email exists (security best practice)
+		return &authv1.RequestPasswordResetResponse{
+			Success: true,
+			Message: "If this email is registered, a reset token has been generated",
+		}, nil
+	}
+
+	// Generate reset token
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Printf("Error generating reset token: %v", err)
+		return &authv1.RequestPasswordResetResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+	tokenStr := hex.EncodeToString(tokenBytes)
+
+	resetToken := &models.PasswordResetToken{
+		Token:     tokenStr,
+		UserID:    user.UserID,
+		ClientID:  user.ClientID,
+		ExpiresAt: time.Now().Add(1 * time.Hour), // 1 hour expiry
+	}
+
+	if err := s.repo.CreatePasswordResetToken(ctx, resetToken); err != nil {
+		log.Printf("Error creating reset token: %v", err)
+		return &authv1.RequestPasswordResetResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	log.Printf("Password reset token generated for user: %s", user.UserID)
+	// NOTE: In production, send this via email instead of returning it
+	return &authv1.RequestPasswordResetResponse{
+		Success:    true,
+		Message:    "Password reset token generated. It expires in 1 hour.",
+		ResetToken: tokenStr,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) ResetPassword(ctx context.Context, req *authv1.ResetPasswordRequest) (*authv1.ResetPasswordResponse, error) {
+	log.Printf("ResetPassword request received")
+
+	if req.ResetToken == "" || req.NewPassword == "" {
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "Reset token and new password are required",
+		}, nil
+	}
+
+	if len(req.NewPassword) < 8 {
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "Password must be at least 8 characters long",
+		}, nil
+	}
+
+	// Validate reset token
+	resetToken, err := s.repo.GetPasswordResetToken(ctx, req.ResetToken)
+	if err != nil {
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "Invalid or expired reset token",
+		}, nil
+	}
+
+	// Get user
+	user, err := s.repo.GetUserByID(ctx, resetToken.UserID)
+	if err != nil {
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "User not found",
+		}, nil
+	}
+
+	// Hash new password
+	hashedPassword, err := utils.HashPassword(req.NewPassword)
+	if err != nil {
+		log.Printf("Error hashing password: %v", err)
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	// Update password
+	user.Password = hashedPassword
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("Error updating user password: %v", err)
+		return &authv1.ResetPasswordResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	// Mark token as used
+	_ = s.repo.MarkPasswordResetTokenUsed(ctx, req.ResetToken)
+
+	// Invalidate all sessions
+	_ = s.repo.DeleteAllUserSessions(ctx, user.UserID)
+
+	log.Printf("Password reset successfully for user: %s", user.UserID)
+	return &authv1.ResetPasswordResponse{
+		Success: true,
+		Message: "Password reset successfully. Please log in with your new password.",
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) RevokeAllSessions(ctx context.Context, req *authv1.RevokeAllSessionsRequest) (*authv1.RevokeAllSessionsResponse, error) {
+	log.Printf("RevokeAllSessions request received")
+
+	if req.AccessToken == "" {
+		return &authv1.RevokeAllSessionsResponse{
+			Success: false,
+			Message: "Access token is required",
+		}, nil
+	}
+
+	claims, err := utils.ValidateJWTToken(req.AccessToken)
+	if err != nil {
+		return &authv1.RevokeAllSessionsResponse{
+			Success: false,
+			Message: "Invalid access token",
+		}, nil
+	}
+
+	// Delete all sessions except the current one (identified by refresh token in JWT)
+	revokedCount, err := s.repo.DeleteOtherUserSessions(ctx, claims.UserID, claims.RefreshToken)
+	if err != nil {
+		log.Printf("Error revoking sessions: %v", err)
+		return &authv1.RevokeAllSessionsResponse{
+			Success: false,
+			Message: "Failed to revoke sessions",
+		}, nil
+	}
+
+	log.Printf("Revoked %d sessions for user: %s", revokedCount, claims.UserID)
+	return &authv1.RevokeAllSessionsResponse{
+		Success:      true,
+		Message:      fmt.Sprintf("Successfully revoked %d other sessions", revokedCount),
+		RevokedCount: revokedCount,
 	}, nil
 }
 

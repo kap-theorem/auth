@@ -31,7 +31,7 @@ export default function ProfilePage() {
                     // Not authenticated, redirect to login via iframe message or normal redirect
                     const isIframe = window.self !== window.top;
                     if (isIframe) {
-                        window.parent.postMessage({ type: 'AUTH_LOGOUT' }, document.referrer || window.location.origin);
+                        window.parent.postMessage({ type: 'AUTH_LOGOUT' }, '*');
                     } else {
                         window.location.href = "/";
                     }
@@ -85,7 +85,7 @@ export default function ProfilePage() {
                 setTimeout(() => {
                     const isIframe = window.self !== window.top;
                     if (isIframe) {
-                        window.parent.postMessage({ type: 'AUTH_LOGOUT' }, document.referrer || window.location.origin);
+                        window.parent.postMessage({ type: 'AUTH_LOGOUT' }, '*');
                     } else {
                         window.location.href = "/";
                     }
