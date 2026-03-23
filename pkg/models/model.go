@@ -10,6 +10,9 @@ type Client struct {
 	ClientID     string         `gorm:"column:client_id;primaryKey;size:36" json:"client_id"`
 	ClientName   string         `gorm:"size:100;not null" json:"client_name"`
 	ClientSecret string         `gorm:"size:255;not null" json:"-"`
+	DemoMode     bool           `gorm:"default:false" json:"demo_mode"`
+	InviteOnly   bool           `gorm:"default:false" json:"invite_only"`
+	LoginType    string         `gorm:"size:20;default:'both'" json:"login_type"`
 	CreatedAt    time.Time      `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt    time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`

@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -7,8 +7,16 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
+# Install protobuf compiler and Go plugins
+RUN apk add --no-cache protobuf protobuf-dev
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
 # Copy source code
 COPY . .
+
+# Generate protobuf files
+RUN protoc -I . -I /usr/include --go_out=. --go-grpc_out=. proto/auth/v1/auth.proto
 
 # Build the application
 RUN go build -o bin/auth-server ./cmd/server/

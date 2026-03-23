@@ -14,9 +14,11 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
       timeout: 20s
       retries: 10
+    networks:
+      - kaplabs-network
 
   auth-service:
     build: .
@@ -26,10 +28,32 @@ services:
       JWT_SECRET: super-secure-jwt-secret-key-for-development-only
       SERVER_PORT: 8080
     ports:
-      - "8080:8080"
+      - "28190:8080" # Exposed on port 28190 as requested
     depends_on:
       mysql:
         condition: service_healthy
+    networks:
+      - kaplabs-network
+
+  auth-frontend:
+    build:
+      context: ./frontend
+    container_name: auth-frontend
+    environment:
+      - NODE_ENV=production
+      # Connecting to auth-service on the internal Docker network (port 8080)
+      - GRPC_SERVER_URL=auth-service:8080
+    ports:
+      - "28191:3000" # Exposed on port 28191 as requested
+    depends_on:
+      - auth-service
+    networks:
+      - kaplabs-network
+
+networks:
+  kaplabs-network:
+    name: kaplabs-network
+    driver: bridge
 
 volumes:
   mysql_data:

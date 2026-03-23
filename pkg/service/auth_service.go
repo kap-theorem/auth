@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -119,13 +120,13 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 }
 
 func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTokenRequest) (*authv1.GetTokenResponse, error) {
-	log.Printf("GetToken request received for email: %s", req.Email)
+	log.Printf("GetToken request received for identifier: %s", req.LoginIdentifier)
 
 	// Validation
-	if req.Email == "" || req.Password == "" || req.ClientId == "" {
+	if req.LoginIdentifier == "" || req.Password == "" || req.ClientId == "" {
 		return &authv1.GetTokenResponse{
 			Success: false,
-			Message: "Email, password, and client ID are required",
+			Message: "Login identifier, password, and client ID are required",
 		}, nil
 	}
 
@@ -145,10 +146,10 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
-	// Get user by email
-	user, err := s.repo.GetUserByEmail(ctx, req.Email)
+	// Get user by identifier (email or username)
+	user, err := s.repo.GetUserByIdentifier(ctx, req.LoginIdentifier)
 	if err != nil {
-		log.Printf("Error getting user by email: %v", err)
+		log.Printf("Error getting user by identifier: %v", err)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -451,6 +452,33 @@ func (s *AuthServiceServerImpl) RegisterClient(ctx context.Context, req *authv1.
 	}, nil
 }
 
+func (s *AuthServiceServerImpl) ValidateClientCredentials(ctx context.Context, req *authv1.ValidateClientCredentialsRequest) (*authv1.ValidateClientCredentialsResponse, error) {
+	log.Printf("ValidateClientCredentials request received for client: %s", req.ClientId)
+
+	if req.ClientId == "" || req.ClientSecret == "" {
+		return &authv1.ValidateClientCredentialsResponse{
+			Valid:   false,
+			Message: "client_id and client_secret are required",
+		}, nil
+	}
+
+	client, err := s.repo.ValidateClient(ctx, req.ClientId, req.ClientSecret)
+	if err != nil {
+		log.Printf("Invalid client credentials for ID: %s", req.ClientId)
+		return &authv1.ValidateClientCredentialsResponse{
+			Valid:   false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	log.Printf("Client credentials verified for: %s", client.ClientName)
+	return &authv1.ValidateClientCredentialsResponse{
+		Valid:      true,
+		Message:    "Credentials valid",
+		ClientName: client.ClientName,
+	}, nil
+}
+
 func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *authv1.ChangeUserPasswordRequest) (*authv1.ChangeUserPasswordResponse, error) {
 	log.Printf("ChangePassword request received")
 
@@ -525,6 +553,115 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 	}, nil
 }
 
+func (s *AuthServiceServerImpl) UpdateUserProfile(ctx context.Context, req *authv1.UpdateUserProfileRequest) (*authv1.UpdateUserProfileResponse, error) {
+	log.Printf("UpdateUserProfile request received")
+
+	if req.AccessToken == "" {
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "Access token is required",
+		}, nil
+	}
+
+	// Validate access token
+	claims, err := utils.ValidateJWTToken(req.AccessToken)
+	if err != nil {
+		log.Printf("Error validating JWT token: %v", err)
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "Invalid access token",
+		}, nil
+	}
+
+	// Get user
+	user, err := s.repo.GetUserByID(ctx, claims.UserID)
+	if err != nil {
+		log.Printf("Error getting user by ID: %v", err)
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "User not found",
+		}, nil
+	}
+
+	// Validate new email if provided
+	if req.NewEmail != "" && req.NewEmail != user.Email {
+		if !s.isValidEmail(req.NewEmail) {
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Invalid email format",
+			}, nil
+		}
+		
+		emailExists, err := s.repo.IsEmailExists(ctx, req.NewEmail)
+		if err != nil {
+			log.Printf("Error checking email existence: %v", err)
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Internal server error",
+			}, nil
+		}
+		if emailExists {
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Email already registered",
+			}, nil
+		}
+		user.Email = req.NewEmail
+	}
+
+	// Validate new username if provided
+	if req.NewUsername != "" && req.NewUsername != user.UserName {
+		// Basic username validation (e.g., length)
+		if len(req.NewUsername) < 3 {
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Username must be at least 3 characters long",
+			}, nil
+		}
+
+		usernameExists, err := s.repo.IsUsernameExists(ctx, req.NewUsername)
+		if err != nil {
+			log.Printf("Error checking username existence: %v", err)
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Internal server error",
+			}, nil
+		}
+		if usernameExists {
+			return &authv1.UpdateUserProfileResponse{
+				Success: false,
+				Message: "Username already taken",
+			}, nil
+		}
+		user.UserName = req.NewUsername
+	}
+
+	// Update user in DB
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("Error updating user profile: %v", err)
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "Failed to update profile",
+		}, nil
+	}
+
+	log.Printf("User profile updated successfully: %s", user.UserID)
+	
+	userProfile := &authv1.UserProfile{
+		UserId:    user.UserID,
+		Username:  user.UserName,
+		Email:     user.Email,
+		ClientId:  user.ClientID,
+		CreatedAt: timestamppb.New(user.CreatedAt),
+	}
+
+	return &authv1.UpdateUserProfileResponse{
+		Success: true,
+		Message: "Profile updated successfully",
+		User:    userProfile,
+	}, nil
+}
+
 func (s *AuthServiceServerImpl) ChangeClientSecret(ctx context.Context, req *authv1.ChangeClientSecretRequest) (*authv1.ChangeClientSecretResponse, error) {
 	log.Printf("ChangeClientSecret request received for client: %s", req.ClientId)
 
@@ -558,6 +695,231 @@ func (s *AuthServiceServerImpl) ChangeClientSecret(ctx context.Context, req *aut
 		Message:      "Client secret updated successfully",
 		ClientId:     req.ClientId,
 		ClientSecret: newSecret,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) ListClients(ctx context.Context, _ *emptypb.Empty) (*authv1.ListClientsResponse, error) {
+	log.Printf("ListClients request received")
+
+	clients, err := s.repo.GetAllClients(ctx)
+	if err != nil {
+		log.Printf("Error fetching clients: %v", err)
+		return nil, fmt.Errorf("failed to fetch clients: %v", err)
+	}
+
+	resClients := make([]*authv1.ClientInfo, len(clients))
+	for i, c := range clients {
+		resClients[i] = &authv1.ClientInfo{
+			ClientId:   c.ClientID,
+			ClientName: c.ClientName,
+			CreatedAt:  timestamppb.New(c.CreatedAt),
+		}
+	}
+
+	return &authv1.ListClientsResponse{
+		Clients: resClients,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) GetSystemStats(ctx context.Context, _ *emptypb.Empty) (*authv1.GetSystemStatsResponse, error) {
+	log.Printf("GetSystemStats request received")
+
+	totalUsers, totalClients, activeSessions, err := s.repo.GetSystemStats(ctx)
+	if err != nil {
+		log.Printf("Error fetching system stats: %v", err)
+		return nil, fmt.Errorf("failed to fetch system stats: %v", err)
+	}
+
+	return &authv1.GetSystemStatsResponse{
+		TotalUsers:     totalUsers,
+		TotalClients:   totalClients,
+		ActiveSessions: activeSessions,
+		SystemHealth:   1.0, // Hardcoded for now, could be dynamic
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) ListClientUsers(ctx context.Context, req *authv1.ListClientUsersRequest) (*authv1.ListClientUsersResponse, error) {
+	log.Printf("ListClientUsers request received for client: %s", req.ClientId)
+
+	users, err := s.repo.GetUsersByClientID(ctx, req.ClientId)
+	if err != nil {
+		log.Printf("Error fetching client users: %v", err)
+		return nil, fmt.Errorf("failed to fetch client users: %v", err)
+	}
+
+	resUsers := make([]*authv1.UserProfile, len(users))
+	for i, u := range users {
+		resUsers[i] = &authv1.UserProfile{
+			UserId:    u.UserID,
+			Username:  u.UserName,
+			Email:     u.Email,
+			ClientId:  u.ClientID,
+			CreatedAt: timestamppb.New(u.CreatedAt),
+		}
+	}
+
+	return &authv1.ListClientUsersResponse{
+		Users: resUsers,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) GetClientStats(ctx context.Context, req *authv1.GetClientStatsRequest) (*authv1.GetClientStatsResponse, error) {
+	log.Printf("GetClientStats request received for client: %s", req.ClientId)
+
+	totalUsers, last24hLogins, err := s.repo.GetClientStats(ctx, req.ClientId)
+	if err != nil {
+		log.Printf("Error fetching client stats: %v", err)
+		return nil, fmt.Errorf("failed to fetch client stats: %v", err)
+	}
+
+	return &authv1.GetClientStatsResponse{
+		TotalUsers:      totalUsers,
+		Last_24HLogins: last24hLogins,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) CreateClientUser(ctx context.Context, req *authv1.CreateClientUserRequest) (*authv1.CreateClientUserResponse, error) {
+	log.Printf("CreateClientUser request received for username: %s", req.Username)
+
+	// Admin-level checks would typically happen at the API Gateway or interceptor level
+	// assuming they are allowed here based on the clientID.
+
+	if req.Username == "" || req.Password == "" || req.ClientId == "" {
+		return &authv1.CreateClientUserResponse{Success: false, Message: "Username, password and client ID are required"}, nil
+	}
+
+	exists, err := s.repo.IsUsernameExists(ctx, req.Username)
+	if err != nil || exists {
+		return &authv1.CreateClientUserResponse{Success: false, Message: "Username already exists"}, nil
+	}
+
+	if req.Email != "" && !s.isValidEmail(req.Email) {
+		return &authv1.CreateClientUserResponse{Success: false, Message: "Invalid email format"}, nil
+	}
+
+	if req.Email != "" {
+		exists, err = s.repo.IsEmailExists(ctx, req.Email)
+		if err != nil || exists {
+			return &authv1.CreateClientUserResponse{Success: false, Message: "Email already exists"}, nil
+		}
+	}
+
+	hashedPassword, err := utils.HashPassword(req.Password)
+	if err != nil {
+		return &authv1.CreateClientUserResponse{Success: false, Message: "Internal server error hashing password"}, nil
+	}
+
+	userID := utils.GenerateUUID()
+	user := &models.User{
+		UserID:   userID,
+		UserName: req.Username,
+		Email:    req.Email,
+		Password: hashedPassword,
+		ClientID: req.ClientId,
+	}
+
+	if err := s.repo.CreateUser(ctx, user); err != nil {
+		log.Printf("Error creating user: %v", err)
+		return &authv1.CreateClientUserResponse{Success: false, Message: "Failed to create user"}, nil
+	}
+
+	return &authv1.CreateClientUserResponse{
+		Success: true,
+		Message: "User created successfully",
+		User: &authv1.UserProfile{
+			UserId:    user.UserID,
+			Username:  user.UserName,
+			Email:     user.Email,
+			ClientId:  user.ClientID,
+			CreatedAt: timestamppb.New(time.Now()),
+		},
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) DeleteClientUser(ctx context.Context, req *authv1.DeleteClientUserRequest) (*emptypb.Empty, error) {
+	log.Printf("DeleteClientUser request received for user: %s under client: %s", req.UserId, req.ClientId)
+
+	// Validate user belongs to the client before deleting
+	user, err := s.repo.GetUserByID(ctx, req.UserId)
+	if err != nil || user.ClientID != req.ClientId {
+		log.Printf("User not found or client ID mismatch")
+		return &emptypb.Empty{}, nil
+	}
+
+	// Delete associated sessions first
+	_ = s.repo.DeleteAllUserSessions(ctx, req.UserId)
+
+	if err := s.repo.DeleteUser(ctx, req.UserId); err != nil {
+		log.Printf("Error deleting user: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func (s *AuthServiceServerImpl) UpdateClientUser(ctx context.Context, req *authv1.UpdateClientUserRequest) (*authv1.UpdateClientUserResponse, error) {
+	log.Printf("UpdateClientUser request for user: %s under client: %s", req.UserId, req.ClientId)
+
+	user, err := s.repo.GetUserByID(ctx, req.UserId)
+	if err != nil || user.ClientID != req.ClientId {
+		return &authv1.UpdateClientUserResponse{Success: false, Message: "User not found or access denied"}, nil
+	}
+
+	if req.NewUsername != "" && req.NewUsername != user.UserName {
+		user.UserName = req.NewUsername
+	}
+	if req.NewEmail != "" && req.NewEmail != user.Email {
+		user.Email = req.NewEmail
+	}
+	if req.NewPassword != "" {
+		hashed, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return &authv1.UpdateClientUserResponse{Success: false, Message: "Failed to hash password"}, nil
+		}
+		user.Password = string(hashed)
+	}
+
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("Error updating user: %v", err)
+		return &authv1.UpdateClientUserResponse{Success: false, Message: "Failed to update user"}, nil
+	}
+
+	return &authv1.UpdateClientUserResponse{Success: true, Message: "User updated successfully"}, nil
+}
+
+func (s *AuthServiceServerImpl) GetClientConfig(ctx context.Context, req *authv1.GetClientConfigRequest) (*authv1.GetClientConfigResponse, error) {
+	client, err := s.repo.GetClientConfig(ctx, req.ClientId)
+	if err != nil {
+		return &authv1.GetClientConfigResponse{Success: false, Message: "Failed to get config"}, nil
+	}
+
+	return &authv1.GetClientConfigResponse{
+		Success: true,
+		Config: &authv1.ClientConfig{
+			DemoMode:   client.DemoMode,
+			InviteOnly: client.InviteOnly,
+			LoginType:  client.LoginType,
+		},
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) UpdateClientConfig(ctx context.Context, req *authv1.UpdateClientConfigRequest) (*authv1.UpdateClientConfigResponse, error) {
+	if req.Config == nil {
+		return &authv1.UpdateClientConfigResponse{Success: false, Message: "Config missing"}, nil
+	}
+
+	if req.Config.LoginType != "both" && req.Config.LoginType != "email" && req.Config.LoginType != "username" {
+		req.Config.LoginType = "both" // Fallback to safe default
+	}
+
+	err := s.repo.UpdateClientConfig(ctx, req.ClientId, req.Config.DemoMode, req.Config.InviteOnly, req.Config.LoginType)
+	if err != nil {
+		return &authv1.UpdateClientConfigResponse{Success: false, Message: "Failed to update config"}, nil
+	}
+
+	return &authv1.UpdateClientConfigResponse{
+		Success: true,
+		Message: "Configuration updated",
+		Config:  req.Config,
 	}, nil
 }
 
