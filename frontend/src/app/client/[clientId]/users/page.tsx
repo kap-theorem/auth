@@ -8,11 +8,14 @@ interface User {
     username: string;
     email: string;
     created_at: { seconds: number; nanos: number };
+    lock_username: boolean;
+    lock_email: boolean;
+    lock_password: boolean;
 }
 
 type ModalMode = 'create' | 'invite' | 'edit' | null;
 
-const EMPTY_FORM = { username: '', email: '', password: '' };
+const EMPTY_FORM = { username: '', email: '', password: '', lockUsername: false, lockEmail: false, lockPassword: false };
 
 export default function ClientUsersPage() {
     const params = useParams();
@@ -64,7 +67,14 @@ export default function ClientUsersPage() {
 
     const openEdit = (user: User) => {
         setEditingUser(user);
-        setForm({ username: user.username, email: user.email, password: '' });
+        setForm({
+            username: user.username,
+            email: user.email,
+            password: '',
+            lockUsername: user.lock_username || false,
+            lockEmail: user.lock_email || false,
+            lockPassword: user.lock_password || false,
+        });
         setFormError('');
         setModalMode('edit');
     };
@@ -146,6 +156,9 @@ export default function ClientUsersPage() {
                     username: form.username,
                     email: form.email,
                     ...(form.password ? { password: form.password } : {}),
+                    lockUsername: form.lockUsername,
+                    lockEmail: form.lockEmail,
+                    lockPassword: form.lockPassword,
                 }),
             });
             const data = await res.json();
@@ -243,7 +256,16 @@ export default function ClientUsersPage() {
                                     {u.username[0].toUpperCase()}
                                 </div>
                                 <div className="flex-1 min-w-0">
-                                    <p className="font-bold text-zinc-900 dark:text-white text-sm">{u.username}</p>
+                                    <div className="flex items-center gap-1.5">
+                                        <p className="font-bold text-zinc-900 dark:text-white text-sm">{u.username}</p>
+                                        {(u.lock_username || u.lock_email || u.lock_password) && (
+                                            <span title="Has field locks">
+                                                <svg className="w-3 h-3 text-amber-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                                                </svg>
+                                            </span>
+                                        )}
+                                    </div>
                                     <p className="text-xs text-zinc-400 truncate">{u.email || "No email"}</p>
                                 </div>
                                 <div className="hidden md:block text-right">
@@ -350,6 +372,18 @@ export default function ClientUsersPage() {
                                     <Field label="Username" required type="text" value={form.username} onChange={v => setForm({ ...form, username: v })} />
                                     <Field label="Email" type="email" placeholder="Leave blank to keep current" value={form.email} onChange={v => setForm({ ...form, email: v })} />
                                     <Field label="New Password" type="password" placeholder="Leave blank to keep current" value={form.password} onChange={v => setForm({ ...form, password: v })} minLength={8} />
+
+                                    {/* Field Locks */}
+                                    <div className="pt-2 border-t border-zinc-200 dark:border-white/10">
+                                        <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-3">User Self-Edit Restrictions</p>
+                                        <div className="space-y-2">
+                                            <LockToggle label="Lock Username" checked={form.lockUsername} onChange={v => setForm({ ...form, lockUsername: v })} />
+                                            <LockToggle label="Lock Email" checked={form.lockEmail} onChange={v => setForm({ ...form, lockEmail: v })} />
+                                            <LockToggle label="Lock Password" checked={form.lockPassword} onChange={v => setForm({ ...form, lockPassword: v })} />
+                                        </div>
+                                        <p className="text-[11px] text-zinc-400 mt-2">Locked fields cannot be changed by the user on their profile page.</p>
+                                    </div>
+
                                     <ModalActions onCancel={closeModal} submitLabel={formLoading ? "Saving…" : "Save Changes"} loading={formLoading} />
                                 </form>
                             </>
@@ -386,5 +420,22 @@ function ModalActions({ onCancel, submitLabel, loading }: { onCancel: () => void
             <button type="button" onClick={onCancel} className="flex-1 px-4 py-3 rounded-xl font-bold text-sm bg-zinc-100 dark:bg-white/5 text-zinc-900 dark:text-white hover:bg-zinc-200 dark:hover:bg-white/10 transition-colors">Cancel</button>
             <button type="submit" disabled={loading} className="flex-1 px-4 py-3 rounded-xl font-bold text-sm bg-indigo-600 text-white hover:bg-indigo-500 transition-colors disabled:opacity-60">{submitLabel}</button>
         </div>
+    );
+}
+
+function LockToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+    return (
+        <label className="flex items-center justify-between py-1.5 px-3 rounded-lg hover:bg-zinc-50 dark:hover:bg-white/5 cursor-pointer transition-colors">
+            <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300 flex items-center gap-2">
+                <svg className={`w-3.5 h-3.5 ${checked ? 'text-amber-500' : 'text-zinc-300 dark:text-zinc-600'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={checked ? "M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" : "M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"} />
+                </svg>
+                {label}
+            </span>
+            <div className={`relative w-9 h-5 rounded-full transition-colors ${checked ? 'bg-amber-500' : 'bg-zinc-200 dark:bg-zinc-700'}`}>
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                <input type="checkbox" className="sr-only" checked={checked} onChange={e => onChange(e.target.checked)} />
+            </div>
+        </label>
     );
 }

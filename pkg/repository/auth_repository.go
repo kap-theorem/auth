@@ -96,7 +96,7 @@ func (r *AuthRepository) UpdateClientSecret(ctx context.Context, clientID, newSe
 
 func (r *AuthRepository) GetClientConfig(ctx context.Context, clientID string) (*models.Client, error) {
 	var client models.Client
-	err := r.db.WithContext(ctx).Select("client_id", "demo_mode", "invite_only", "login_type").Where("client_id = ?", clientID).First(&client).Error
+	err := r.db.WithContext(ctx).Select("client_id", "client_name", "demo_mode", "invite_only", "login_type").Where("client_id = ?", clientID).First(&client).Error
 	if err != nil {
 		return nil, err
 	}
@@ -266,4 +266,39 @@ func (r *AuthRepository) GetInviteToken(ctx context.Context, token string) (*mod
 
 func (r *AuthRepository) MarkInviteTokenUsed(ctx context.Context, token string) error {
 	return r.db.WithContext(ctx).Model(&models.InviteToken{}).Where("token = ?", token).Update("used", true).Error
+}
+
+// DailyLoginCount holds a single day's login count for activity queries.
+type DailyLoginCount struct {
+	Date  string `gorm:"column:date"`
+	Count int64  `gorm:"column:count"`
+}
+
+// GetLoginActivityByClient returns daily login (session creation) counts for a client.
+func (r *AuthRepository) GetLoginActivityByClient(ctx context.Context, clientID string, days int) ([]DailyLoginCount, error) {
+	since := time.Now().AddDate(0, 0, -days)
+	var results []DailyLoginCount
+	err := r.db.WithContext(ctx).
+		Model(&models.Session{}).
+		Select("DATE(created_at) as date, COUNT(*) as count").
+		Where("client_id = ? AND created_at >= ?", clientID, since).
+		Group("DATE(created_at)").
+		Order("date").
+		Scan(&results).Error
+	return results, err
+}
+
+// CountNewUsersByClient counts users created within the last N days for a client.
+func (r *AuthRepository) CountNewUsersByClient(ctx context.Context, clientID string, days int) (int64, error) {
+	var count int64
+	since := time.Now().AddDate(0, 0, -days)
+	err := r.db.WithContext(ctx).Model(&models.User{}).Where("client_id = ? AND created_at >= ?", clientID, since).Count(&count).Error
+	return count, err
+}
+
+// CountActiveSessionsByClient counts non-expired, non-deleted sessions for a client.
+func (r *AuthRepository) CountActiveSessionsByClient(ctx context.Context, clientID string) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Session{}).Where("client_id = ? AND expires_at > ?", clientID, time.Now()).Count(&count).Error
+	return count, err
 }

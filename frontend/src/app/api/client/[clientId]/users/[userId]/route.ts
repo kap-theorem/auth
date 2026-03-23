@@ -20,6 +20,9 @@ export async function PATCH(
             new_username: body.username || '',
             new_email: body.email || '',
             new_password: body.password || '',
+            lock_username: body.lockUsername || false,
+            lock_email: body.lockEmail || false,
+            lock_password: body.lockPassword || false,
         }, (err: any, response: any) => {
             if (err) {
                 console.error(`[API] UpdateClientUser gRPC Error:`, err);

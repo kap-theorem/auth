@@ -23,7 +23,8 @@ export async function GET(
 
             resolve(NextResponse.json({
                 success: true,
-                config: response.config || { demoMode: false, inviteOnly: false, loginType: "both" }
+                config: response.config || { demo_mode: false, invite_only: false, login_type: "both" },
+                client_name: response.client_name || "",
             }));
         });
     });

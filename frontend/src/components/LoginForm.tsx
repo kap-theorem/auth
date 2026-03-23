@@ -11,7 +11,6 @@ interface LoginFormProps {
     redirectUrl?: string; // Optional: If missing, redirects to /dashboard
     showSignUp?: boolean; // Whether to show the "Don't have an account? Sign up" link
     signUpUrl?: string;   // The explicit URL to send users for signup
-    hideForgot?: boolean; // Hide "Forgot password?" link
     showDemo?: boolean;   // Show "Login as demo user" link
     loginType?: "both" | "email" | "username"; // The authentication variant
 }
@@ -23,7 +22,6 @@ export default function LoginForm({
     redirectUrl = "/dashboard",
     showSignUp = false,
     signUpUrl = "/register",
-    hideForgot = false,
     showDemo = false,
     loginType = "email"
 }: LoginFormProps) {
@@ -172,19 +170,9 @@ export default function LoginForm({
                             />
                         </div>
                         <div>
-                            <div className="flex justify-between items-center mb-1">
-                                <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                                    Password
-                                </label>
-                                {!hideForgot && (
-                                    <Link
-                                        href="/forgot-password"
-                                        className="text-xs font-semibold text-purple-600 dark:text-purple-400 hover:text-purple-500 transition-colors"
-                                    >
-                                        Forgot password?
-                                    </Link>
-                                )}
-                            </div>
+                            <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                                Password
+                            </label>
                             <input
                                 type="password"
                                 required

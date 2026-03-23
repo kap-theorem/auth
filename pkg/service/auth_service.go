@@ -2,6 +2,7 @@ package service
 
 import (
 	"authservice/pkg/models"
+	"authservice/pkg/ratelimit"
 	"authservice/pkg/repository"
 	"authservice/pkg/utils"
 	authv1 "authservice/proto/auth/v1"
@@ -23,6 +24,19 @@ import (
 type AuthServiceServerImpl struct {
 	authv1.UnimplementedAuthServiceServer
 	repo *repository.AuthRepository
+}
+
+func userToProfile(u *models.User) *authv1.UserProfile {
+	return &authv1.UserProfile{
+		UserId:       u.UserID,
+		Username:     u.UserName,
+		Email:        u.Email,
+		ClientId:     u.ClientID,
+		CreatedAt:    timestamppb.New(u.CreatedAt),
+		LockUsername: u.LockUsername,
+		LockEmail:    u.LockEmail,
+		LockPassword: u.LockPassword,
+	}
 }
 
 func NewAuthServiceServer(db *gorm.DB) *AuthServiceServerImpl {
@@ -174,6 +188,15 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
+	// Rate limiting check
+	if limited, remaining := ratelimit.IsRateLimited(req.LoginIdentifier); limited {
+		log.Printf("Rate limited login attempt for identifier: %s", req.LoginIdentifier)
+		return &authv1.GetTokenResponse{
+			Success: false,
+			Message: ratelimit.FormatLockoutMessage(remaining),
+		}, nil
+	}
+
 	// Check if client exists
 	clientExists, err := s.repo.IsClientExists(ctx, req.ClientId)
 	if err != nil {
@@ -194,6 +217,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	user, err := s.repo.GetUserByIdentifier(ctx, req.LoginIdentifier)
 	if err != nil {
 		log.Printf("Error getting user by identifier: %v", err)
+		ratelimit.RecordFailedAttempt(req.LoginIdentifier)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -202,6 +226,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 
 	// Check if user belongs to the client
 	if user.ClientID != req.ClientId {
+		ratelimit.RecordFailedAttempt(req.LoginIdentifier)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -210,6 +235,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 
 	// Verify password
 	if !utils.CheckPasswordHash(req.Password, user.Password) {
+		ratelimit.RecordFailedAttempt(req.LoginIdentifier)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -253,13 +279,10 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
-	userProfile := &authv1.UserProfile{
-		UserId:    user.UserID,
-		Username:  user.UserName,
-		Email:     user.Email,
-		ClientId:  user.ClientID,
-		CreatedAt: timestamppb.New(user.CreatedAt),
-	}
+	userProfile := userToProfile(user)
+
+	// Clear rate limit on successful login
+	ratelimit.ResetAttempts(req.LoginIdentifier)
 
 	log.Printf("User logged in successfully: %s", user.UserID)
 	return &authv1.GetTokenResponse{
@@ -329,13 +352,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		}, nil
 	}
 
-	userProfile := &authv1.UserProfile{
-		UserId:    user.UserID,
-		Username:  user.UserName,
-		Email:     user.Email,
-		ClientId:  user.ClientID,
-		CreatedAt: timestamppb.New(user.CreatedAt),
-	}
+	userProfile := userToProfile(user)
 
 	return &authv1.ValidateTokenResponse{
 		Valid:     true,
@@ -553,6 +570,14 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 		}, nil
 	}
 
+	// Check if password is locked by admin
+	if user.LockPassword {
+		return &authv1.ChangeUserPasswordResponse{
+			Success: false,
+			Message: "Password changes are disabled by your administrator",
+		}, nil
+	}
+
 	// Verify current password
 	if !utils.CheckPasswordHash(req.CurrentPassword, user.Password) {
 		return &authv1.ChangeUserPasswordResponse{
@@ -627,6 +652,20 @@ func (s *AuthServiceServerImpl) UpdateUserProfile(ctx context.Context, req *auth
 		}, nil
 	}
 
+	// Check field locks set by admin
+	if req.NewEmail != "" && req.NewEmail != user.Email && user.LockEmail {
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "Email changes are disabled by your administrator",
+		}, nil
+	}
+	if req.NewUsername != "" && req.NewUsername != user.UserName && user.LockUsername {
+		return &authv1.UpdateUserProfileResponse{
+			Success: false,
+			Message: "Username changes are disabled by your administrator",
+		}, nil
+	}
+
 	// Validate new email if provided
 	if req.NewEmail != "" && req.NewEmail != user.Email {
 		if !s.isValidEmail(req.NewEmail) {
@@ -690,19 +729,11 @@ func (s *AuthServiceServerImpl) UpdateUserProfile(ctx context.Context, req *auth
 	}
 
 	log.Printf("User profile updated successfully: %s", user.UserID)
-	
-	userProfile := &authv1.UserProfile{
-		UserId:    user.UserID,
-		Username:  user.UserName,
-		Email:     user.Email,
-		ClientId:  user.ClientID,
-		CreatedAt: timestamppb.New(user.CreatedAt),
-	}
 
 	return &authv1.UpdateUserProfileResponse{
 		Success: true,
 		Message: "Profile updated successfully",
-		User:    userProfile,
+		User:    userToProfile(user),
 	}, nil
 }
 
@@ -793,13 +824,7 @@ func (s *AuthServiceServerImpl) ListClientUsers(ctx context.Context, req *authv1
 
 	resUsers := make([]*authv1.UserProfile, len(users))
 	for i, u := range users {
-		resUsers[i] = &authv1.UserProfile{
-			UserId:    u.UserID,
-			Username:  u.UserName,
-			Email:     u.Email,
-			ClientId:  u.ClientID,
-			CreatedAt: timestamppb.New(u.CreatedAt),
-		}
+		resUsers[i] = userToProfile(&u)
 	}
 
 	return &authv1.ListClientUsersResponse{
@@ -816,9 +841,23 @@ func (s *AuthServiceServerImpl) GetClientStats(ctx context.Context, req *authv1.
 		return nil, fmt.Errorf("failed to fetch client stats: %v", err)
 	}
 
+	newUsersLast7d, err := s.repo.CountNewUsersByClient(ctx, req.ClientId, 7)
+	if err != nil {
+		log.Printf("Error fetching new users count: %v", err)
+		return nil, fmt.Errorf("failed to fetch new users count: %v", err)
+	}
+
+	activeSessions, err := s.repo.CountActiveSessionsByClient(ctx, req.ClientId)
+	if err != nil {
+		log.Printf("Error fetching active sessions count: %v", err)
+		return nil, fmt.Errorf("failed to fetch active sessions count: %v", err)
+	}
+
 	return &authv1.GetClientStatsResponse{
 		TotalUsers:      totalUsers,
-		Last_24HLogins: last24hLogins,
+		Last_24HLogins:  last24hLogins,
+		NewUsersLast_7D: newUsersLast7d,
+		ActiveSessions:  activeSessions,
 	}, nil
 }
 
@@ -870,13 +909,7 @@ func (s *AuthServiceServerImpl) CreateClientUser(ctx context.Context, req *authv
 	return &authv1.CreateClientUserResponse{
 		Success: true,
 		Message: "User created successfully",
-		User: &authv1.UserProfile{
-			UserId:    user.UserID,
-			Username:  user.UserName,
-			Email:     user.Email,
-			ClientId:  user.ClientID,
-			CreatedAt: timestamppb.New(time.Now()),
-		},
+		User:    userToProfile(user),
 	}, nil
 }
 
@@ -921,6 +954,11 @@ func (s *AuthServiceServerImpl) UpdateClientUser(ctx context.Context, req *authv
 		}
 		user.Password = string(hashed)
 	}
+
+	// Update field locks (admin can always set these)
+	user.LockUsername = req.LockUsername
+	user.LockEmail = req.LockEmail
+	user.LockPassword = req.LockPassword
 
 	if err := s.repo.UpdateUser(ctx, user); err != nil {
 		log.Printf("Error updating user: %v", err)
@@ -990,7 +1028,8 @@ func (s *AuthServiceServerImpl) GetClientConfig(ctx context.Context, req *authv1
 	}
 
 	return &authv1.GetClientConfigResponse{
-		Success: true,
+		Success:    true,
+		ClientName: client.ClientName,
 		Config: &authv1.ClientConfig{
 			DemoMode:   client.DemoMode,
 			InviteOnly: client.InviteOnly,
@@ -1176,6 +1215,42 @@ func (s *AuthServiceServerImpl) RevokeAllSessions(ctx context.Context, req *auth
 		Success:      true,
 		Message:      fmt.Sprintf("Successfully revoked %d other sessions", revokedCount),
 		RevokedCount: revokedCount,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) GetClientLoginActivity(ctx context.Context, req *authv1.GetClientLoginActivityRequest) (*authv1.GetClientLoginActivityResponse, error) {
+	log.Printf("GetClientLoginActivity request received for client: %s", req.ClientId)
+
+	if req.ClientId == "" {
+		return &authv1.GetClientLoginActivityResponse{
+			Success: false,
+		}, nil
+	}
+
+	days := int(req.Days)
+	if days <= 0 {
+		days = 30
+	}
+
+	activity, err := s.repo.GetLoginActivityByClient(ctx, req.ClientId, days)
+	if err != nil {
+		log.Printf("Error fetching login activity: %v", err)
+		return &authv1.GetClientLoginActivityResponse{
+			Success: false,
+		}, nil
+	}
+
+	dailyLogins := make([]*authv1.DailyLoginCount, len(activity))
+	for i, a := range activity {
+		dailyLogins[i] = &authv1.DailyLoginCount{
+			Date:  a.Date,
+			Count: a.Count,
+		}
+	}
+
+	return &authv1.GetClientLoginActivityResponse{
+		Success:     true,
+		DailyLogins: dailyLogins,
 	}, nil
 }
 

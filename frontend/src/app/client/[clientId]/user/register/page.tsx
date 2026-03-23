@@ -22,6 +22,7 @@ function RegisterForm({ clientId }: { clientId: string }) {
     const [error, setError] = useState("");
     const [configLoading, setConfigLoading] = useState(true);
     const [isInviteOnly, setIsInviteOnly] = useState(false);
+    const [clientName, setClientName] = useState("");
 
     useEffect(() => {
         fetch(`/api/client/${clientId}/config`)
@@ -29,6 +30,9 @@ function RegisterForm({ clientId }: { clientId: string }) {
             .then(data => {
                 if (data.success && data.config) {
                     setIsInviteOnly(data.config.invite_only || false);
+                }
+                if (data.success && data.client_name) {
+                    setClientName(data.client_name);
                 }
             })
             .catch(() => {})
@@ -82,10 +86,10 @@ function RegisterForm({ clientId }: { clientId: string }) {
 
                     <div className="text-center mb-8">
                         <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white mb-2">
-                            Create an account
+                            {clientName ? `Join ${clientName}` : "Create an account"}
                         </h1>
                         <p className="text-sm text-zinc-500 dark:text-zinc-400">
-                            Registering for {clientId}
+                            Authentication powered by auth.kaplabs.dev
                         </p>
                     </div>
 

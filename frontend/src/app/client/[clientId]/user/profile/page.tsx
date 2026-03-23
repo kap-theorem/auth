@@ -17,6 +17,8 @@ export default function ProfilePage() {
     const [profileMessage, setProfileMessage] = useState({ text: "", type: "" });
     const [passwordMessage, setPasswordMessage] = useState({ text: "", type: "" });
 
+    const [locks, setLocks] = useState({ lockUsername: false, lockEmail: false, lockPassword: false });
+
     useEffect(() => {
         // Fetch current session details
         const fetchSession = async () => {
@@ -27,6 +29,11 @@ export default function ProfilePage() {
                     setUser(data.user);
                     setUsername(data.user.username);
                     setEmail(data.user.email);
+                    setLocks({
+                        lockUsername: data.user.lockUsername || false,
+                        lockEmail: data.user.lockEmail || false,
+                        lockPassword: data.user.lockPassword || false,
+                    });
                 } else {
                     // Not authenticated, redirect to login via iframe message or normal redirect
                     const isIframe = window.self !== window.top;
@@ -129,34 +136,59 @@ export default function ProfilePage() {
                         )}
 
                         <div>
-                            <label className="block text-sm font-medium text-zinc-400 mb-1">Username</label>
+                            <label className="block text-sm font-medium text-zinc-400 mb-1">
+                                Username
+                                {locks.lockUsername && <span className="ml-2 text-amber-400 text-xs font-semibold">Locked</span>}
+                            </label>
                             <input
                                 type="text"
                                 value={username}
                                 onChange={(e) => setUsername(e.target.value)}
-                                className="w-full px-4 py-3 bg-black/20 border border-white/10 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-white placeholder-zinc-600 outline-none"
+                                disabled={locks.lockUsername}
+                                className={`w-full px-4 py-3 bg-black/20 border border-white/10 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-white placeholder-zinc-600 outline-none ${locks.lockUsername ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 required
                             />
                         </div>
                         <div>
-                            <label className="block text-sm font-medium text-zinc-400 mb-1">Email Address</label>
+                            <label className="block text-sm font-medium text-zinc-400 mb-1">
+                                Email Address
+                                {locks.lockEmail && <span className="ml-2 text-amber-400 text-xs font-semibold">Locked</span>}
+                            </label>
                             <input
                                 type="email"
                                 value={email}
                                 onChange={(e) => setEmail(e.target.value)}
-                                className="w-full px-4 py-3 bg-black/20 border border-white/10 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-white placeholder-zinc-600 outline-none"
+                                disabled={locks.lockEmail}
+                                className={`w-full px-4 py-3 bg-black/20 border border-white/10 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all text-white placeholder-zinc-600 outline-none ${locks.lockEmail ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 required
                             />
                         </div>
-                        <button
-                            type="submit"
-                            className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-lg text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all"
-                        >
-                            Update Profile
-                        </button>
+                        {(!locks.lockUsername && !locks.lockEmail) ? (
+                            <button
+                                type="submit"
+                                className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-lg text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all"
+                            >
+                                Update Profile
+                            </button>
+                        ) : (locks.lockUsername && locks.lockEmail) ? (
+                            <p className="text-xs text-amber-400/70 text-center py-2">Profile editing is disabled by your administrator.</p>
+                        ) : (
+                            <button
+                                type="submit"
+                                className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-lg text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all"
+                            >
+                                Update Profile
+                            </button>
+                        )}
                     </form>
 
                     {/* Password Change Form */}
+                    {locks.lockPassword ? (
+                        <div className="pt-4 border-t border-white/10">
+                            <h3 className="text-lg font-bold text-zinc-300 border-b border-white/10 pb-2">Change Password</h3>
+                            <p className="text-sm text-amber-400/70 text-center py-6">Password changes are disabled by your administrator.</p>
+                        </div>
+                    ) : (
                     <form onSubmit={handleChangePassword} className="space-y-4 pt-4 border-t border-white/10">
                         <h3 className="text-lg font-bold text-zinc-300 border-b border-white/10 pb-2">Change Password</h3>
 
@@ -194,6 +226,7 @@ export default function ProfilePage() {
                             Change Password
                         </button>
                     </form>
+                    )}
 
                 </div>
             </div>

@@ -19,14 +19,17 @@ type Client struct {
 }
 
 type User struct {
-	UserID    string         `gorm:"column:user_id;primaryKey;size:36" json:"user_id"`
-	UserName  string         `gorm:"column:user_name;size:100;not null" json:"username"`
-	Email     string         `gorm:"column:email_id;size:255;uniqueIndex;not null" json:"email"`
-	Password  string         `gorm:"size:255;not null" json:"-"`
-	ClientID  string         `gorm:"column:client_id;size:36;not null;index" json:"client_id"`
-	CreatedAt time.Time      `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
-	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+	UserID       string         `gorm:"column:user_id;primaryKey;size:36" json:"user_id"`
+	UserName     string         `gorm:"column:user_name;size:100;not null" json:"username"`
+	Email        string         `gorm:"column:email_id;size:255;uniqueIndex;not null" json:"email"`
+	Password     string         `gorm:"size:255;not null" json:"-"`
+	ClientID     string         `gorm:"column:client_id;size:36;not null;index" json:"client_id"`
+	LockUsername bool           `gorm:"default:false" json:"lock_username"`
+	LockEmail    bool           `gorm:"default:false" json:"lock_email"`
+	LockPassword bool           `gorm:"default:false" json:"lock_password"`
+	CreatedAt    time.Time      `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt    time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
+	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 type Session struct {

@@ -25,7 +25,9 @@ export async function GET(
                 success: true,
                 stats: {
                     totalUsers: response.total_users,
-                    last24hLogins: response.last_24h_logins || 0
+                    last24hLogins: response.last_24h_logins || 0,
+                    newUsersLast7d: response.new_users_last_7d || 0,
+                    activeSessions: response.active_sessions || 0
                 }
             }));
         });

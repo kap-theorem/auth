@@ -11,6 +11,7 @@ interface PageProps {
 function UserLogin({ clientId }: { clientId: string }) {
     const searchParams = useSearchParams();
     const [config, setConfig] = useState<any>(null);
+    const [clientName, setClientName] = useState<string>("");
 
     useEffect(() => {
         fetch(`/api/client/${clientId}/config`)
@@ -18,6 +19,7 @@ function UserLogin({ clientId }: { clientId: string }) {
             .then(data => {
                 if (data.success) {
                     setConfig(data.config);
+                    setClientName(data.client_name || "");
                 } else {
                     setConfig({ demo_mode: false, invite_only: false, login_type: 'both' });
                 }
@@ -26,8 +28,6 @@ function UserLogin({ clientId }: { clientId: string }) {
     }, [clientId]);
 
     const redirectUrl = searchParams.get("redirect") || "/dashboard";
-    const hideForgot = searchParams.get("hide_forgot") === "true";
-
     // Config overrides
     const showDemo = config?.demo_mode || false;
     const loginType = config?.login_type || "both";
@@ -39,15 +39,18 @@ function UserLogin({ clientId }: { clientId: string }) {
         return <div className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-black text-zinc-500">Loading Configuration...</div>;
     }
 
+    const title = clientName
+        ? `Sign in to ${clientName}`
+        : "Sign in to continue";
+
     return (
         <LoginForm
-            title="Sign in to continue"
-            description="Enter your credentials to access the application"
+            title={title}
+            description="Authentication powered by auth.kaplabs.dev"
             clientId={clientId}
             redirectUrl={redirectUrl}
             showSignUp={showSignUp}
             signUpUrl={signUpUrl}
-            hideForgot={hideForgot}
             showDemo={showDemo}
             loginType={loginType}
         />

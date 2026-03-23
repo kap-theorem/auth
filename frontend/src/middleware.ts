@@ -16,7 +16,7 @@ export function middleware(request: NextRequest) {
     // APP ADMIN ROUTES — guard dashboard, /users, /settings
     // /client/[id], /client/[id]/users, /client/[id]/settings
     // ───────────────────────────────────────────────
-    const clientAdminRegex = /^\/client\/([^/]+)(\/users|\/settings)?\/?$/;
+    const clientAdminRegex = /^\/client\/([^/]+)(\/users|\/settings|\/security)?\/?$/;
     const clientMatch = pathname.match(clientAdminRegex);
 
     if (clientMatch) {

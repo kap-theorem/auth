@@ -73,6 +73,10 @@ service AuthService {
   // Session Management
   // Revokes all sessions for the authenticated user (except current)
   rpc RevokeAllSessions(RevokeAllSessionsRequest) returns (RevokeAllSessionsResponse);
+
+  // Analytics
+  // Returns daily login counts for a specific client over a given period
+  rpc GetClientLoginActivity(GetClientLoginActivityRequest) returns (GetClientLoginActivityResponse);
 }
 
 message HealthCheckResponse {
@@ -93,6 +97,9 @@ message UserProfile {
   string email = 3;
   string client_id = 4;
   google.protobuf.Timestamp created_at = 5;
+  bool lock_username = 6;
+  bool lock_email = 7;
+  bool lock_password = 8;
 }
 
 // Request/Response Definitions
@@ -251,6 +258,8 @@ message GetClientStatsRequest {
 message GetClientStatsResponse {
     int64 total_users = 1;
     int64 last_24h_logins = 2;
+    int64 new_users_last_7d = 3;
+    int64 active_sessions = 4;
 }
 
 message CreateClientUserRequest {
@@ -277,6 +286,9 @@ message UpdateClientUserRequest {
     string new_username = 3;
     string new_email = 4;
     string new_password = 5;
+    bool lock_username = 6;
+    bool lock_email = 7;
+    bool lock_password = 8;
 }
 
 message UpdateClientUserResponse {
@@ -298,6 +310,7 @@ message GetClientConfigResponse {
     bool success = 1;
     string message = 2;
     ClientConfig config = 3;
+    string client_name = 4;
 }
 
 message UpdateClientConfigRequest {
@@ -354,4 +367,20 @@ message RevokeAllSessionsResponse {
     bool success = 1;
     string message = 2;
     int64 revoked_count = 3;
+}
+
+// Login Activity
+message GetClientLoginActivityRequest {
+    string client_id = 1;
+    int32 days = 2; // number of days of history (default 30)
+}
+
+message DailyLoginCount {
+    string date = 1; // YYYY-MM-DD format
+    int64 count = 2;
+}
+
+message GetClientLoginActivityResponse {
+    bool success = 1;
+    repeated DailyLoginCount daily_logins = 2;
 }

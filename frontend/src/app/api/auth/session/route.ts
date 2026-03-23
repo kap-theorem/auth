@@ -25,6 +25,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
                     username: response.user?.username || "",
                     email: response.user?.email || "",
                     clientId: response.user?.client_id || "",
+                    lockUsername: response.user?.lock_username || false,
+                    lockEmail: response.user?.lock_email || false,
+                    lockPassword: response.user?.lock_password || false,
                 }
             }));
         });
