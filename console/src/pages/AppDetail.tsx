@@ -7,6 +7,7 @@ import {
   AuthzModel,
   Effect,
   IdentityScope,
+  LoginIdentifier,
   RelationTuple,
   SubjectType,
   TupleKey,
@@ -166,6 +167,8 @@ function CredentialsTab({ app, onChange }: { app: App; onChange: (a: App) => voi
       </div>
 
       <RedirectUrisCard app={app} busy={busy} onSave={saveRedirects} />
+
+      <HostedOptionsCard app={app} onChange={onChange} />
 
       <form className="card" onSubmit={saveName}>
         <h2>Settings</h2>
@@ -327,6 +330,148 @@ function RedirectUrisCard({
   );
 }
 
+// ------------------------------------------------ hosted login options
+
+const LOGIN_IDENTIFIER_LABELS: Record<LoginIdentifier, string> = {
+  username_or_email: "email or username",
+  email_only: "email only",
+  username_only: "username only",
+};
+
+function HostedOptionsCard({ app, onChange }: { app: App; onChange: (a: App) => void }) {
+  const [demoEnabled, setDemoEnabled] = useState(app.demo_enabled);
+  const [demoEmail, setDemoEmail] = useState("");
+  const [demoPassword, setDemoPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const run = (fn: () => Promise<void>) => {
+    setError(null);
+    setSaved(false);
+    setBusy(true);
+    fn()
+      .then(() => setSaved(true))
+      .catch((err) => setError(err instanceof Error ? err.message : "Request failed."))
+      .finally(() => setBusy(false));
+  };
+
+  const saveDemo = (e: FormEvent) => {
+    e.preventDefault();
+    run(async () => {
+      onChange(
+        await api.updateApp(app.client_id, {
+          demo_enabled: demoEnabled,
+          // Only send credentials when the developer typed them; they are
+          // write-only and never read back.
+          ...(demoEmail.trim() ? { demo_email: demoEmail.trim() } : {}),
+          ...(demoPassword ? { demo_password: demoPassword } : {}),
+        })
+      );
+      setDemoPassword("");
+    });
+  };
+
+  const setLoginIdentifier = (value: LoginIdentifier) =>
+    run(async () => {
+      onChange(await api.updateApp(app.client_id, { login_identifier: value }));
+    });
+
+  const setPublicSignup = (value: boolean) =>
+    run(async () => {
+      onChange(await api.updateApp(app.client_id, { public_signup: value }));
+    });
+
+  return (
+    <div className="card">
+      <h2>Hosted login options</h2>
+      <p className="card-sub">
+        Controls for the platform-hosted login page: one-click demo access, which
+        identifier users sign in with, and public self-service signup.
+      </p>
+
+      <form onSubmit={saveDemo} style={{ marginBottom: 20 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <input
+            type="checkbox"
+            checked={demoEnabled}
+            onChange={(e) => setDemoEnabled(e.target.checked)}
+            disabled={busy}
+            style={{ width: "auto" }}
+          />
+          <span>Enable "Login as Demo User"</span>
+        </label>
+        <p className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
+          Enabling demo requires a demo email and password. They are stored write-only —
+          re-enter them to change the demo account.
+        </p>
+        <div className="form-row">
+          <label className="field">
+            <span>Demo email</span>
+            <input
+              type="email"
+              value={demoEmail}
+              onChange={(e) => setDemoEmail(e.target.value)}
+              placeholder="demo@example.com"
+              autoComplete="off"
+              disabled={busy}
+            />
+          </label>
+          <label className="field">
+            <span>Demo password</span>
+            <input
+              type="password"
+              value={demoPassword}
+              onChange={(e) => setDemoPassword(e.target.value)}
+              placeholder="••••••••"
+              autoComplete="new-password"
+              disabled={busy}
+            />
+          </label>
+        </div>
+        <button className="btn secondary" disabled={busy}>
+          Save demo settings
+        </button>
+      </form>
+
+      <label className="field" style={{ maxWidth: 360 }}>
+        <span>Login identifier</span>
+        <select
+          className="mono"
+          value={app.login_identifier}
+          onChange={(e) => setLoginIdentifier(e.target.value as LoginIdentifier)}
+          disabled={busy}
+        >
+          <option value="username_or_email">
+            username_or_email — {LOGIN_IDENTIFIER_LABELS.username_or_email}
+          </option>
+          <option value="email_only">email_only — {LOGIN_IDENTIFIER_LABELS.email_only}</option>
+          <option value="username_only">
+            username_only — {LOGIN_IDENTIFIER_LABELS.username_only}
+          </option>
+        </select>
+      </label>
+      <p className="hint" style={{ marginBottom: 16 }}>
+        Sets the label and placeholder on the hosted login form's identifier field.
+      </p>
+
+      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={app.public_signup}
+          onChange={(e) => setPublicSignup(e.target.checked)}
+          disabled={busy}
+          style={{ width: "auto" }}
+        />
+        <span>Allow public signup on the hosted login page</span>
+      </label>
+
+      {error && <p className="error-text">{error}</p>}
+      {saved && <p className="ok-text">Saved.</p>}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------- users
 
 /** The exact tuple the Admin toggle reads and writes. */
@@ -349,6 +494,7 @@ function UsersTab({ clientId }: { clientId: string }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [sessions, setSessions] = useState<UserSession[] | null>(null);
   const [confirming, setConfirming] = useState<AppUser | null>(null);
+  const [editing, setEditing] = useState<AppUser | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -437,6 +583,24 @@ function UsersTab({ clientId }: { clientId: string }) {
       await loadUsers();
     });
 
+  const saveEdit = (
+    userId: string,
+    patch: {
+      username?: string;
+      email?: string;
+      password?: string;
+      lock_username?: boolean;
+      lock_email?: boolean;
+      lock_password?: boolean;
+    }
+  ) =>
+    run(async () => {
+      await api.updateUser(clientId, userId, patch);
+      setEditing(null);
+      setNotice("User updated.");
+      await loadUsers();
+    });
+
   const toggleAdmin = (userId: string) =>
     run(async () => {
       const tuple = adminTuple(clientId, userId);
@@ -506,6 +670,7 @@ function UsersTab({ clientId }: { clientId: string }) {
                 onToggleSessions={() => toggleSessions(u.user_id)}
                 onRevokeAll={() => revokeAll(u.user_id)}
                 onToggleAdmin={() => toggleAdmin(u.user_id)}
+                onEdit={() => setEditing(u)}
                 onConfirmDeactivate={() => setConfirming(u)}
                 onCancelDeactivate={() => setConfirming(null)}
                 onSetActive={(active) => setActive(u, active)}
@@ -513,6 +678,15 @@ function UsersTab({ clientId }: { clientId: string }) {
             ))}
           </tbody>
         </table>
+      )}
+
+      {editing && (
+        <EditUserDialog
+          user={editing}
+          busy={busy}
+          onSave={(patch) => saveEdit(editing.user_id, patch)}
+          onClose={() => setEditing(null)}
+        />
       )}
     </div>
   );
@@ -528,6 +702,7 @@ function UserRow({
   onToggleSessions,
   onRevokeAll,
   onToggleAdmin,
+  onEdit,
   onConfirmDeactivate,
   onCancelDeactivate,
   onSetActive,
@@ -541,6 +716,7 @@ function UserRow({
   onToggleSessions: () => void;
   onRevokeAll: () => void;
   onToggleAdmin: () => void;
+  onEdit: () => void;
   onConfirmDeactivate: () => void;
   onCancelDeactivate: () => void;
   onSetActive: (active: boolean) => void;
@@ -575,6 +751,13 @@ function UserRow({
           </button>
         </td>
         <td style={{ textAlign: "right" }}>
+          {!confirming && (
+            <>
+              <button className="btn secondary small" onClick={onEdit} disabled={busy}>
+                Edit
+              </button>{" "}
+            </>
+          )}
           {user.active ? (
             confirming ? (
               <>
@@ -630,6 +813,125 @@ function UserRow({
         </tr>
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------- edit user dialog
+
+function EditUserDialog({
+  user,
+  busy,
+  onSave,
+  onClose,
+}: {
+  user: AppUser;
+  busy: boolean;
+  onSave: (patch: {
+    username?: string;
+    email?: string;
+    password?: string;
+    lock_username?: boolean;
+    lock_email?: boolean;
+    lock_password?: boolean;
+  }) => void;
+  onClose: () => void;
+}) {
+  const [username, setUsername] = useState(user.username);
+  const [email, setEmail] = useState(user.email);
+  const [password, setPassword] = useState("");
+  const [lockUsername, setLockUsername] = useState(user.lock_username);
+  const [lockEmail, setLockEmail] = useState(user.lock_email);
+  const [lockPassword, setLockPassword] = useState(user.lock_password);
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    onSave({
+      // Only send changed identity fields; a blank password means "unchanged".
+      ...(username.trim() !== user.username ? { username: username.trim() } : {}),
+      ...(email.trim() !== user.email ? { email: email.trim() } : {}),
+      ...(password ? { password } : {}),
+      ...(lockUsername !== user.lock_username ? { lock_username: lockUsername } : {}),
+      ...(lockEmail !== user.lock_email ? { lock_email: lockEmail } : {}),
+      ...(lockPassword !== user.lock_password ? { lock_password: lockPassword } : {}),
+    });
+  };
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Edit user">
+      <form className="modal" onSubmit={submit}>
+        <h2>Edit user</h2>
+        <p style={{ margin: 0, color: "var(--muted)" }}>
+          Change this user's identity and set per-field self-edit locks. A locked field
+          cannot be changed by the user on their own account page.
+        </p>
+        <div style={{ marginTop: 14 }}>
+          <label className="field">
+            <span>Username</span>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoComplete="off"
+            />
+          </label>
+          <label className="field">
+            <span>Email</span>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="off"
+            />
+          </label>
+          <label className="field">
+            <span>New password (leave blank to keep)</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="new-password"
+            />
+          </label>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={lockUsername}
+              onChange={(e) => setLockUsername(e.target.checked)}
+              style={{ width: "auto" }}
+            />
+            <span>Lock username</span>
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={lockEmail}
+              onChange={(e) => setLockEmail(e.target.checked)}
+              style={{ width: "auto" }}
+            />
+            <span>Lock email</span>
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={lockPassword}
+              onChange={(e) => setLockPassword(e.target.checked)}
+              style={{ width: "auto" }}
+            />
+            <span>Lock password</span>
+          </label>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="btn secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button className="btn" disabled={busy}>
+            {busy ? "Saving…" : "Save changes"}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 

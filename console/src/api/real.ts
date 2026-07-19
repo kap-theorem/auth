@@ -24,6 +24,7 @@ import {
   DeveloperSession,
   Effect,
   IdentityScope,
+  LoginIdentifier,
   Organization,
   PlatformMetrics,
   RelationTuple,
@@ -47,6 +48,9 @@ interface WireApp {
   suspended?: boolean;
   createdAt?: string;
   redirectUris?: string[];
+  demoEnabled?: boolean;
+  loginIdentifier?: string;
+  publicSignup?: boolean;
 }
 
 interface WireTuple {
@@ -67,6 +71,9 @@ interface WireAppUser {
   active?: boolean;
   sessionCount?: number | string;
   scope?: UserScope;
+  lockUsername?: boolean;
+  lockEmail?: boolean;
+  lockPassword?: boolean;
 }
 
 interface WireSessionInfo {
@@ -102,6 +109,28 @@ function mapApp(w: WireApp): App {
     status: w.suspended ? "suspended" : "active",
     created_at: w.createdAt ?? "",
     redirect_uris: w.redirectUris ?? [],
+    demo_enabled: !!w.demoEnabled,
+    login_identifier: normalizeLoginIdentifier(w.loginIdentifier),
+    public_signup: !!w.publicSignup,
+  };
+}
+
+function normalizeLoginIdentifier(v: string | undefined): LoginIdentifier {
+  return v === "email_only" || v === "username_only" ? v : "username_or_email";
+}
+
+function mapAppUser(w: WireAppUser): AppUser {
+  return {
+    user_id: w.userId,
+    username: w.username ?? "",
+    email: w.email ?? "",
+    created_at: w.createdAt ?? "",
+    active: !!w.active,
+    session_count: num(w.sessionCount),
+    scope: w.scope === "org" ? "org" : "app",
+    lock_username: !!w.lockUsername,
+    lock_email: !!w.lockEmail,
+    lock_password: !!w.lockPassword,
   };
 }
 
@@ -380,7 +409,16 @@ export class RealApiClient implements ApiClient {
 
   async updateApp(
     clientId: string,
-    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
+    patch: {
+      name?: string;
+      identity_scope?: IdentityScope;
+      redirect_uris?: string[];
+      demo_enabled?: boolean;
+      demo_email?: string;
+      demo_password?: string;
+      login_identifier?: LoginIdentifier;
+      public_signup?: boolean;
+    }
   ): Promise<App> {
     const r = await this.post<{ app: WireApp }>("UpdateApp", {
       accessToken: this.token(),
@@ -392,6 +430,11 @@ export class RealApiClient implements ApiClient {
       ...(patch.redirect_uris !== undefined
         ? { redirectUris: patch.redirect_uris, setRedirectUris: true }
         : {}),
+      ...(patch.demo_enabled !== undefined ? { demoEnabled: patch.demo_enabled } : {}),
+      ...(patch.demo_email !== undefined ? { demoEmail: patch.demo_email } : {}),
+      ...(patch.demo_password !== undefined ? { demoPassword: patch.demo_password } : {}),
+      ...(patch.login_identifier !== undefined ? { loginIdentifier: patch.login_identifier } : {}),
+      ...(patch.public_signup !== undefined ? { publicSignup: patch.public_signup } : {}),
     });
     return mapApp(r.app);
   }
@@ -514,15 +557,7 @@ export class RealApiClient implements ApiClient {
       clientId,
       ...(query ? { query } : {}),
     });
-    return (r.users ?? []).map((w) => ({
-      user_id: w.userId,
-      username: w.username ?? "",
-      email: w.email ?? "",
-      created_at: w.createdAt ?? "",
-      active: !!w.active,
-      session_count: num(w.sessionCount),
-      scope: w.scope === "org" ? "org" : "app",
-    }));
+    return (r.users ?? []).map(mapAppUser);
   }
 
   async listUserSessions(clientId: string, userId: string): Promise<UserSession[]> {
@@ -555,6 +590,32 @@ export class RealApiClient implements ApiClient {
       active,
     });
     return r.message ?? (active ? "User reactivated." : "User deactivated.");
+  }
+
+  async updateUser(
+    clientId: string,
+    userId: string,
+    patch: {
+      username?: string;
+      email?: string;
+      password?: string;
+      lock_username?: boolean;
+      lock_email?: boolean;
+      lock_password?: boolean;
+    }
+  ): Promise<AppUser> {
+    const r = await this.post<{ user: WireAppUser }>("UpdateUser", {
+      accessToken: this.token(),
+      clientId,
+      userId,
+      ...(patch.username !== undefined ? { username: patch.username } : {}),
+      ...(patch.email !== undefined ? { email: patch.email } : {}),
+      ...(patch.password !== undefined ? { password: patch.password } : {}),
+      ...(patch.lock_username !== undefined ? { lockUsername: patch.lock_username } : {}),
+      ...(patch.lock_email !== undefined ? { lockEmail: patch.lock_email } : {}),
+      ...(patch.lock_password !== undefined ? { lockPassword: patch.lock_password } : {}),
+    });
+    return mapAppUser(r.user);
   }
 
   // ---- superadmin ----

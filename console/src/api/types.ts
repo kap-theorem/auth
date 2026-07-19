@@ -6,6 +6,8 @@ export type IdentityScope = "app" | "org";
 export type ClientStatus = "active" | "suspended";
 export type Effect = "allow" | "deny";
 export type SubjectType = "user" | "role";
+/** Which identifier a hosted-login user types (drives the input's label). */
+export type LoginIdentifier = "username_or_email" | "email_only" | "username_only";
 
 export interface Organization {
   org_id: string;
@@ -29,6 +31,12 @@ export interface App {
   created_at: string;
   /** Exact redirect URIs whitelisted for hosted login. Empty = disabled. */
   redirect_uris: string[];
+  /** One-click demo login on the hosted login page. */
+  demo_enabled: boolean;
+  /** Which identifier hosted-login users authenticate with. */
+  login_identifier: LoginIdentifier;
+  /** Whether the hosted login page offers public self-service signup. */
+  public_signup: boolean;
 }
 
 export interface AuthzModel {
@@ -88,6 +96,10 @@ export interface AppUser {
   session_count: number;
   /** "org" users are shared across the org's apps — deactivation is org-wide. */
   scope: UserScope;
+  /** Self-edit locks: when true, the user cannot change this field themselves. */
+  lock_username: boolean;
+  lock_email: boolean;
+  lock_password: boolean;
 }
 
 /** One of an end user's sessions, listed by an app admin. */
@@ -129,7 +141,17 @@ export interface ApiClient {
   listApps(): Promise<App[]>;
   updateApp(
     clientId: string,
-    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
+    patch: {
+      name?: string;
+      identity_scope?: IdentityScope;
+      redirect_uris?: string[];
+      demo_enabled?: boolean;
+      /** Write-only demo credentials (never returned). Required to enable demo. */
+      demo_email?: string;
+      demo_password?: string;
+      login_identifier?: LoginIdentifier;
+      public_signup?: boolean;
+    }
   ): Promise<App>;
   rotateAppSecret(clientId: string): Promise<{ client_secret: string }>;
   deleteApp(clientId: string): Promise<void>;
@@ -168,6 +190,23 @@ export interface ApiClient {
    * Resolves to the backend's human-readable outcome message.
    */
   setUserActive(clientId: string, userId: string, active: boolean): Promise<string>;
+  /**
+   * Admin self-service edit of an app user: change username/email/password and
+   * toggle per-field self-edit locks. Omit a field to leave it unchanged.
+   * Resolves to the updated user.
+   */
+  updateUser(
+    clientId: string,
+    userId: string,
+    patch: {
+      username?: string;
+      email?: string;
+      password?: string;
+      lock_username?: boolean;
+      lock_email?: boolean;
+      lock_password?: boolean;
+    }
+  ): Promise<AppUser>;
 
   // ---- Superadmin (§7; backend re-checks Check(platform, me, admin, app:platform)) ----
   listAllOrgs(): Promise<Organization[]>;

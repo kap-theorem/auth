@@ -99,6 +99,12 @@ export default function HostedProfile() {
   const [notice, setNotice] = useState<string | null>(null);
   const [loggedOut, setLoggedOut] = useState(false);
 
+  // Profile self-edit state.
+  const [editing, setEditing] = useState(false);
+  const [editUsername, setEditUsername] = useState("");
+  const [editEmail, setEditEmail] = useState("");
+  const [saveBusy, setSaveBusy] = useState(false);
+
   // Change-password form state.
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -167,6 +173,44 @@ export default function HostedProfile() {
   }, [token, load]);
 
   // ---- Actions -----------------------------------------------------------
+  const startEdit = () => {
+    setError(null);
+    setNotice(null);
+    setEditUsername(profile?.user?.username ?? "");
+    setEditEmail(profile?.user?.email ?? "");
+    setEditing(true);
+  };
+
+  const saveProfile = async (e: FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    setSaveBusy(true);
+    try {
+      // Send only changed fields; the server rejects a locked field with a
+      // human-readable message we surface as-is.
+      const r = await post<ProfileResponse>("HostedUpdateProfile", {
+        clientId,
+        accessToken: token,
+        ...(editUsername.trim() !== (profile?.user?.username ?? "")
+          ? { username: editUsername.trim() }
+          : {}),
+        ...(editEmail.trim() !== (profile?.user?.email ?? "")
+          ? { email: editEmail.trim() }
+          : {}),
+      });
+      if (!r.success) throw new Error(r.message || "Could not update your profile.");
+      setNotice(r.message || "Profile updated.");
+      setEditing(false);
+      if (r.user) setProfile((p) => (p ? { ...p, user: r.user } : p));
+      else if (token) void load(token);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update your profile.");
+    } finally {
+      setSaveBusy(false);
+    }
+  };
+
   const changePassword = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -277,10 +321,62 @@ export default function HostedProfile() {
       <h2>Your account</h2>
       <p className="card-sub">Account management hosted by kaplabs iam.</p>
 
-      <div style={{ margin: "12px 0" }}>
-        <div><strong>{profile.user?.username || "—"}</strong></div>
-        <div className="card-sub">{profile.user?.email}</div>
-      </div>
+      {editing ? (
+        <form onSubmit={saveProfile} style={{ margin: "12px 0" }}>
+          <label className="field">
+            <span>Username</span>
+            <input
+              type="text"
+              value={editUsername}
+              onChange={(e) => setEditUsername(e.target.value)}
+              autoComplete="username"
+            />
+          </label>
+          <label className="field">
+            <span>Email</span>
+            <input
+              type="email"
+              value={editEmail}
+              onChange={(e) => setEditEmail(e.target.value)}
+              autoComplete="email"
+            />
+          </label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn" disabled={saveBusy}>
+              {saveBusy ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={saveBusy}
+              onClick={() => {
+                setEditing(false);
+                setError(null);
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div
+          style={{
+            margin: "12px 0",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 8,
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div><strong>{profile.user?.username || "—"}</strong></div>
+            <div className="card-sub">{profile.user?.email}</div>
+          </div>
+          <button className="btn secondary" style={{ flexShrink: 0 }} onClick={startEdit}>
+            Edit
+          </button>
+        </div>
+      )}
 
       {notice && <p style={{ color: "var(--allow, #2e7d32)", fontSize: 13 }}>{notice}</p>}
       {error && <p className="error-text">{error}</p>}

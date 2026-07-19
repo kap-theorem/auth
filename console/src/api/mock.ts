@@ -15,6 +15,7 @@ import {
   Developer,
   DeveloperSession,
   IdentityScope,
+  LoginIdentifier,
   Organization,
   PLATFORM_CLIENT_ID,
   PlatformMetrics,
@@ -73,6 +74,9 @@ const apps: App[] = [
     status: "active",
     created_at: "2026-01-05T09:00:00Z",
     redirect_uris: [],
+    demo_enabled: false,
+    login_identifier: "username_or_email",
+    public_signup: false,
   },
   {
     client_id: "client_wordskali",
@@ -82,6 +86,9 @@ const apps: App[] = [
     status: "active",
     created_at: "2026-02-11T14:25:00Z",
     redirect_uris: ["https://wordskali.example.dev/auth/callback"],
+    demo_enabled: true,
+    login_identifier: "username_or_email",
+    public_signup: true,
   },
   {
     client_id: "client_dsapanicle",
@@ -91,6 +98,9 @@ const apps: App[] = [
     status: "active",
     created_at: "2026-04-19T08:12:00Z",
     redirect_uris: [],
+    demo_enabled: false,
+    login_identifier: "email_only",
+    public_signup: false,
   },
   {
     client_id: "client_helioscan",
@@ -100,6 +110,9 @@ const apps: App[] = [
     status: "suspended",
     created_at: "2026-03-02T10:10:00Z",
     redirect_uris: [],
+    demo_enabled: false,
+    login_identifier: "username_or_email",
+    public_signup: false,
   },
 ];
 
@@ -187,6 +200,9 @@ interface MockEndUser {
   active: boolean;
   scope_type: UserScope;
   scope_id: string;
+  lock_username?: boolean;
+  lock_email?: boolean;
+  lock_password?: boolean;
 }
 
 const endUsers: MockEndUser[] = [
@@ -252,6 +268,9 @@ function s(
   const expires = new Date(new Date(created_at).getTime() + 7 * 24 * 3600 * 1000);
   return { session_id, user_id, client_id, user_agent, created_at, expires_at: expires.toISOString() };
 }
+
+// Write-only demo credentials per app (never returned by updateApp/listApps).
+const mockDemoCreds = new Map<string, { email: string; password: string }>();
 
 // fake platform-wide counts for the metrics page (mock has few end users)
 const counters = { users: 12_840, active_sessions: 861 };
@@ -418,6 +437,9 @@ export class MockApiClient implements ApiClient {
       status: "active",
       created_at: now(),
       redirect_uris: [],
+      demo_enabled: false,
+      login_identifier: "username_or_email",
+      public_signup: false,
     };
     apps.push(app);
     return delay({ app: { ...app }, client_secret: randomSecret() });
@@ -432,7 +454,16 @@ export class MockApiClient implements ApiClient {
 
   async updateApp(
     clientId: string,
-    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
+    patch: {
+      name?: string;
+      identity_scope?: IdentityScope;
+      redirect_uris?: string[];
+      demo_enabled?: boolean;
+      demo_email?: string;
+      demo_password?: string;
+      login_identifier?: LoginIdentifier;
+      public_signup?: boolean;
+    }
   ): Promise<App> {
     const app = this.ownedApp(clientId);
     if (patch.name !== undefined) {
@@ -442,6 +473,22 @@ export class MockApiClient implements ApiClient {
     if (patch.identity_scope !== undefined) app.identity_scope = patch.identity_scope;
     if (patch.redirect_uris !== undefined)
       app.redirect_uris = patch.redirect_uris.map((u) => u.trim()).filter(Boolean);
+    if (patch.demo_enabled !== undefined) {
+      // Mirror the backend: enabling demo requires stored demo credentials.
+      const hasCreds =
+        (patch.demo_email ?? "").trim() !== "" && (patch.demo_password ?? "") !== "";
+      if (patch.demo_enabled && !hasCreds && !mockDemoCreds.has(clientId))
+        return fail("Demo login needs a demo email and password.");
+      app.demo_enabled = patch.demo_enabled;
+    }
+    // demo_email/demo_password are write-only: stored, never returned.
+    if ((patch.demo_email ?? "").trim() !== "" && patch.demo_password)
+      mockDemoCreds.set(clientId, {
+        email: patch.demo_email!.trim(),
+        password: patch.demo_password,
+      });
+    if (patch.login_identifier !== undefined) app.login_identifier = patch.login_identifier;
+    if (patch.public_signup !== undefined) app.public_signup = patch.public_signup;
     return delay({ ...app, redirect_uris: [...app.redirect_uris] });
   }
 
@@ -624,6 +671,9 @@ export class MockApiClient implements ApiClient {
           (ms) => ms.user_id === u.user_id && ms.client_id === clientId
         ).length,
         scope: u.scope_type,
+        lock_username: !!u.lock_username,
+        lock_email: !!u.lock_email,
+        lock_password: !!u.lock_password,
       }))
     );
   }
@@ -660,6 +710,49 @@ export class MockApiClient implements ApiClient {
         ? "User deactivated; this is an org-scoped identity, so they are disabled and logged out across ALL of the org's apps"
         : "User deactivated; all of their sessions have been revoked"
     );
+  }
+
+  async updateUser(
+    clientId: string,
+    userId: string,
+    patch: {
+      username?: string;
+      email?: string;
+      password?: string;
+      lock_username?: boolean;
+      lock_email?: boolean;
+      lock_password?: boolean;
+    }
+  ): Promise<AppUser> {
+    const app = this.ownedApp(clientId);
+    const user = this.scopedUser(app, userId);
+    if (patch.username !== undefined) {
+      if (!patch.username.trim()) return fail("Username cannot be empty.");
+      user.username = patch.username.trim();
+    }
+    if (patch.email !== undefined) {
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(patch.email.trim()))
+        return fail("Enter a valid email address.");
+      user.email = patch.email.trim();
+    }
+    // patch.password is write-only in the mock (no stored credential store).
+    if (patch.lock_username !== undefined) user.lock_username = patch.lock_username;
+    if (patch.lock_email !== undefined) user.lock_email = patch.lock_email;
+    if (patch.lock_password !== undefined) user.lock_password = patch.lock_password;
+    return delay({
+      user_id: user.user_id,
+      username: user.username,
+      email: user.email,
+      created_at: user.created_at,
+      active: user.active,
+      session_count: mockSessions.filter(
+        (ms) => ms.user_id === user.user_id && ms.client_id === clientId
+      ).length,
+      scope: user.scope_type,
+      lock_username: !!user.lock_username,
+      lock_email: !!user.lock_email,
+      lock_password: !!user.lock_password,
+    });
   }
 
   // ---- superadmin ----
