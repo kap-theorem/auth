@@ -1,7 +1,9 @@
 # Hosted app features: demo login, login-identifier, public signup, self-edit + locks
 
 Date: 2026-07-19
-Status: Design approved, pre-implementation
+Status: Implemented (backend + console frontend). Deferred: per-IP rate
+limiting on HostedRegister (needs X-Forwarded-For plumbing through the HTTP
+gateway) — see the `ponytail:` note in pkg/ratelimit/ratelimit.go.
 Repo: `git_repos/kaplabs/auth`
 
 ## Background
