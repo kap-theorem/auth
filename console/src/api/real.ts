@@ -17,6 +17,7 @@ import {
   ApiClient,
   ApiError,
   App,
+  AppUser,
   AuthzModel,
   CheckResult,
   Developer,
@@ -29,6 +30,8 @@ import {
   SubjectType,
   TupleFilter,
   TupleKey,
+  UserScope,
+  UserSession,
 } from "./types";
 
 const BASE = "/auth.v1.PlatformService";
@@ -54,6 +57,23 @@ interface WireTuple {
   subjectId: string;
   effect: Effect;
   conditionExpr?: string;
+}
+
+interface WireAppUser {
+  userId: string;
+  username?: string;
+  email?: string;
+  createdAt?: string;
+  active?: boolean;
+  sessionCount?: number | string;
+  scope?: UserScope;
+}
+
+interface WireSessionInfo {
+  sessionId: string;
+  userAgent?: string;
+  createdAt?: string;
+  expiresAt?: string;
 }
 
 interface WireOrg {
@@ -484,6 +504,57 @@ export class RealApiClient implements ApiClient {
   async listObjects(): Promise<string[]> {
     // Not part of the backend contract yet; the console does not call it.
     throw new ApiError("ListObjects is not available on the real backend yet.");
+  }
+
+  // ---- app user management ----
+
+  async listAppUsers(clientId: string, query?: string): Promise<AppUser[]> {
+    const r = await this.post<{ users?: WireAppUser[] }>("ListAppUsers", {
+      accessToken: this.token(),
+      clientId,
+      ...(query ? { query } : {}),
+    });
+    return (r.users ?? []).map((w) => ({
+      user_id: w.userId,
+      username: w.username ?? "",
+      email: w.email ?? "",
+      created_at: w.createdAt ?? "",
+      active: !!w.active,
+      session_count: num(w.sessionCount),
+      scope: w.scope === "org" ? "org" : "app",
+    }));
+  }
+
+  async listUserSessions(clientId: string, userId: string): Promise<UserSession[]> {
+    const r = await this.post<{ sessions?: WireSessionInfo[] }>("ListUserSessionsAdmin", {
+      accessToken: this.token(),
+      clientId,
+      userId,
+    });
+    return (r.sessions ?? []).map((w) => ({
+      session_id: w.sessionId,
+      user_agent: w.userAgent ?? "",
+      created_at: w.createdAt ?? "",
+      expires_at: w.expiresAt ?? "",
+    }));
+  }
+
+  async revokeUserSessions(clientId: string, userId: string): Promise<void> {
+    await this.post("RevokeUserSessionsAdmin", {
+      accessToken: this.token(),
+      clientId,
+      userId,
+    });
+  }
+
+  async setUserActive(clientId: string, userId: string, active: boolean): Promise<string> {
+    const r = await this.post<{ message?: string }>("SetUserActive", {
+      accessToken: this.token(),
+      clientId,
+      userId,
+      active,
+    });
+    return r.message ?? (active ? "User reactivated." : "User deactivated.");
   }
 
   // ---- superadmin ----

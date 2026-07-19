@@ -3,6 +3,7 @@ package repository
 import (
 	"authservice/pkg/models"
 	"context"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -48,6 +49,64 @@ func (r *AuthRepository) UpdateUser(ctx context.Context, user *models.User) erro
 
 func (r *AuthRepository) DeleteUser(ctx context.Context, userID string) error {
 	return r.db.WithContext(ctx).Delete(&models.User{}, "user_id = ?", userID).Error
+}
+
+// SetUserActive flips a user's active flag. Deactivated users cannot log in
+// through any flow and their existing tokens stop validating.
+func (r *AuthRepository) SetUserActive(ctx context.Context, userID string, active bool) error {
+	return r.db.WithContext(ctx).
+		Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("active", active).Error
+}
+
+// escapeLike escapes SQL LIKE metacharacters so user-supplied query text is
+// matched literally. Uses '!' as the escape char (ESCAPE '!' alongside):
+// a literal '\' breaks MySQL string literals while SQLite rejects
+// multi-char escapes, so backslash can't be dialect-neutral here.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `!`, `!!`)
+	s = strings.ReplaceAll(s, `%`, `!%`)
+	return strings.ReplaceAll(s, `_`, `!_`)
+}
+
+// ListUsersByScope lists an identity scope's users (one app's user base, or
+// an org's shared pool), optionally filtered by a substring match on
+// username OR email.
+func (r *AuthRepository) ListUsersByScope(ctx context.Context, scopeType, scopeID, query string) ([]models.User, error) {
+	q := r.db.WithContext(ctx).Where("scope_type = ? AND scope_id = ?", scopeType, scopeID)
+	if query != "" {
+		like := "%" + escapeLike(query) + "%"
+		q = q.Where(`(user_name LIKE ? ESCAPE '!' OR email_id LIKE ? ESCAPE '!')`, like, like)
+	}
+	var users []models.User
+	if err := q.Order("created_at ASC").Find(&users).Error; err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+// CountSessionsByUserForClient returns active-session counts per user under
+// one client (one grouped query for the admin Users listing).
+func (r *AuthRepository) CountSessionsByUserForClient(ctx context.Context, clientID string) (map[string]int64, error) {
+	var rows []struct {
+		UserID string
+		N      int64
+	}
+	err := r.db.WithContext(ctx).
+		Model(&models.Session{}).
+		Select("user_id, COUNT(*) AS n").
+		Where("client_id = ? AND expires_at > ?", clientID, time.Now()).
+		Group("user_id").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		counts[row.UserID] = row.N
+	}
+	return counts, nil
 }
 
 // Client operations

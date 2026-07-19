@@ -60,6 +60,26 @@ The vite dev server proxies `/auth.v1` → `http://localhost:8081`
   throws (no page calls it). The console's substring tuple filter is applied
   client-side on top of `ListTuples`.
 
+## Users tab (app user management)
+
+App detail → **Users** lists the app's end users (spec "App user
+management"): debounced search on username/email, per-user session count,
+created date, and active status. Users from an org-scoped app's shared pool
+carry an `org` badge — deactivating one disables the identity across every
+app in the org, and the UI warns before doing it.
+
+Per-row actions:
+
+- **Sessions** — expands the row to show the user's active sessions (user
+  agent, started) with a "Revoke all sessions" button
+  (`ListUserSessionsAdmin` / `RevokeUserSessionsAdmin`).
+- **Deactivate / Reactivate** — `SetUserActive`; deactivation revokes all
+  the user's sessions and blocks every login flow (confirm required, with
+  the org-wide warning for org-scoped users).
+- **Make/Remove admin** — convenience writer for the exact tuple
+  `app:<client_id> admin user:<user_id>` via WriteTuples/DeleteTuples;
+  current state is read from ListTuples on load.
+
 ## Hosted account page
 
 Public iframe-friendly page where an app's end user manages their own
@@ -155,7 +175,10 @@ via sessionStorage.
 
 The interface mirrors the spec's RPCs: DeveloperLogin, RegisterDeveloper,
 CreateApp/ListApps/UpdateApp/RotateAppSecret/DeleteApp, WriteAuthzModel/
-GetAuthzModel, WriteTuples/DeleteTuples/Check/ListObjects, plus superadmin
+GetAuthzModel, WriteTuples/DeleteTuples/Check/ListObjects, user management
+ListAppUsers/ListUserSessionsAdmin/RevokeUserSessionsAdmin/SetUserActive
+(mock seeds a few wordskali users — one deactivated, one app admin — and an
+org-scoped user under dsapanicle), plus superadmin
 ListAllOrgs/ListAllApps/SuspendClient/RestoreClient/ListDevelopers/
 GetPlatformMetrics. `listTuples` is a console read helper — the gateway will
 need an equivalent ReadTuples RPC for the tuple browser.

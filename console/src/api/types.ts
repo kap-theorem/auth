@@ -74,6 +74,30 @@ export interface PlatformMetrics {
   tuples: number;
 }
 
+/** Where an app user's identity lives (spec "App user management"). */
+export type UserScope = "app" | "org";
+
+/** One end user of an app, as seen by its developer. */
+export interface AppUser {
+  user_id: string;
+  username: string;
+  email: string;
+  created_at: string;
+  active: boolean;
+  /** Active sessions under THIS app. */
+  session_count: number;
+  /** "org" users are shared across the org's apps — deactivation is org-wide. */
+  scope: UserScope;
+}
+
+/** One of an end user's sessions, listed by an app admin. */
+export interface UserSession {
+  session_id: string;
+  user_agent: string;
+  created_at: string;
+  expires_at: string;
+}
+
 export interface TupleFilter {
   object?: string; // "type:id", "type:" or bare text matched against object
   subject?: string; // same, matched against subject
@@ -130,6 +154,20 @@ export interface ApiClient {
     relation: string,
     objectType: string
   ): Promise<string[]>;
+
+  // ---- App user management (spec "App user management") ----
+  /** Lists an app's end users; query is a substring match on username OR email. */
+  listAppUsers(clientId: string, query?: string): Promise<AppUser[]>;
+  listUserSessions(clientId: string, userId: string): Promise<UserSession[]>;
+  /** Revokes ALL of one user's sessions under this app. */
+  revokeUserSessions(clientId: string, userId: string): Promise<void>;
+  /**
+   * Activates/deactivates a user. Deactivation revokes every session the
+   * user holds (across ALL of the org's apps for org-scoped users — the
+   * identity is disabled, not one app's access) and blocks all logins.
+   * Resolves to the backend's human-readable outcome message.
+   */
+  setUserActive(clientId: string, userId: string, active: boolean): Promise<string>;
 
   // ---- Superadmin (§7; backend re-checks Check(platform, me, admin, app:platform)) ----
   listAllOrgs(): Promise<Organization[]>;

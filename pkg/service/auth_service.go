@@ -323,6 +323,16 @@ func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, clie
 		}, nil
 	}
 
+	// Deactivated users are rejected with the same generic message —
+	// deactivation is never distinguishable from bad credentials.
+	if !user.Active {
+		log.Printf("Login rejected for deactivated user %s (client: %s)", user.UserID, client.ClientID)
+		return &authv1.GetTokenResponse{
+			Success: false,
+			Message: "Invalid credentials",
+		}, nil
+	}
+
 	// Create a new session (multi-session: one row per login/device)
 	sessionID := utils.GenerateUUID()
 	refreshToken, refreshHash, err := utils.GenerateRefreshToken(sessionID)
@@ -410,10 +420,18 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		}, nil
 	}
 
-	// Check the user still exists
+	// Check the user still exists and is active (deactivation invalidates
+	// outstanding tokens even if a session row were to survive)
 	user, err := s.repo.GetUserByID(ctx, claims.Subject)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
+		return &authv1.ValidateTokenResponse{
+			Valid:   false,
+			Message: "Invalid token",
+		}, nil
+	}
+	if !user.Active {
+		log.Printf("Token rejected for deactivated user %s (client: %s)", user.UserID, req.ClientId)
 		return &authv1.ValidateTokenResponse{
 			Valid:   false,
 			Message: "Invalid token",

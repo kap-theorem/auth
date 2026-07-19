@@ -1,10 +1,21 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, App, AuthzModel, Effect, IdentityScope, RelationTuple, SubjectType } from "../api";
+import {
+  api,
+  App,
+  AppUser,
+  AuthzModel,
+  Effect,
+  IdentityScope,
+  RelationTuple,
+  SubjectType,
+  TupleKey,
+  UserSession,
+} from "../api";
 import SecretModal from "../components/SecretModal";
 import Fact from "../components/Fact";
 
-type Tab = "credentials" | "model" | "tuples" | "check";
+type Tab = "credentials" | "users" | "model" | "tuples" | "check";
 
 export default function AppDetail() {
   const { clientId = "" } = useParams();
@@ -53,6 +64,7 @@ export default function AppDetail() {
         {(
           [
             ["credentials", "Credentials"],
+            ["users", "Users"],
             ["model", "Authz model"],
             ["tuples", "Tuples"],
             ["check", "Check tester"],
@@ -71,6 +83,7 @@ export default function AppDetail() {
       </div>
 
       {tab === "credentials" && <CredentialsTab app={app} onChange={setApp} />}
+      {tab === "users" && <UsersTab clientId={app.client_id} />}
       {tab === "model" && <ModelTab clientId={app.client_id} />}
       {tab === "tuples" && <TuplesTab clientId={app.client_id} />}
       {tab === "check" && <CheckTab clientId={app.client_id} />}
@@ -311,6 +324,312 @@ function RedirectUrisCard({
       </form>
       {draftError && <p className="error-text">{draftError}</p>}
     </div>
+  );
+}
+
+// ---------------------------------------------------------- users
+
+/** The exact tuple the Admin toggle reads and writes. */
+function adminTuple(clientId: string, userId: string): TupleKey {
+  return {
+    object_type: "app",
+    object_id: clientId,
+    relation: "admin",
+    subject_type: "user",
+    subject_id: userId,
+    effect: "allow",
+  };
+}
+
+function UsersTab({ clientId }: { clientId: string }) {
+  const [users, setUsers] = useState<AppUser[] | null>(null);
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [admins, setAdmins] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<UserSession[] | null>(null);
+  const [confirming, setConfirming] = useState<AppUser | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Debounce the search box (~300ms) before hitting the API.
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(query.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  const loadUsers = () =>
+    api
+      .listAppUsers(clientId, debounced || undefined)
+      .then(setUsers)
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load users."));
+
+  useEffect(() => {
+    setError(null);
+    loadUsers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId, debounced]);
+
+  // Current admin state: the exact (app:<client_id>, admin, user:<id>) tuples.
+  useEffect(() => {
+    api
+      .listTuples(clientId, { object: `app:${clientId}` })
+      .then((rows) =>
+        setAdmins(
+          new Set(
+            rows
+              .filter(
+                (r) =>
+                  r.object_type === "app" &&
+                  r.object_id === clientId &&
+                  r.relation === "admin" &&
+                  r.subject_type === "user" &&
+                  r.effect === "allow"
+              )
+              .map((r) => r.subject_id)
+          )
+        )
+      )
+      .catch(() => setAdmins(new Set()));
+  }, [clientId]);
+
+  const run = async (fn: () => Promise<void>) => {
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await fn();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleSessions = (userId: string) => {
+    if (expanded === userId) {
+      setExpanded(null);
+      setSessions(null);
+      return;
+    }
+    setExpanded(userId);
+    setSessions(null);
+    api
+      .listUserSessions(clientId, userId)
+      .then(setSessions)
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load sessions."));
+  };
+
+  const revokeAll = (userId: string) =>
+    run(async () => {
+      await api.revokeUserSessions(clientId, userId);
+      setSessions([]);
+      setNotice("All of the user's sessions for this app were revoked.");
+      await loadUsers();
+    });
+
+  const setActive = (user: AppUser, active: boolean) =>
+    run(async () => {
+      const message = await api.setUserActive(clientId, user.user_id, active);
+      setConfirming(null);
+      setNotice(message);
+      await loadUsers();
+    });
+
+  const toggleAdmin = (userId: string) =>
+    run(async () => {
+      const tuple = adminTuple(clientId, userId);
+      const next = new Set(admins);
+      if (admins.has(userId)) {
+        await api.deleteTuples(clientId, [tuple]);
+        next.delete(userId);
+      } else {
+        await api.writeTuples(clientId, [tuple]);
+        next.add(userId);
+      }
+      setAdmins(next);
+    });
+
+  return (
+    <div className="card" style={{ padding: 0 }}>
+      <div style={{ padding: "14px 16px", borderBottom: "1px solid var(--line)" }}>
+        <h2 style={{ marginBottom: 4 }}>Users</h2>
+        <p className="card-sub" style={{ marginBottom: 10 }}>
+          Your app's end users. <span className="badge">org</span> users belong to the org's
+          shared pool — deactivating one disables the identity across every app in the org.
+          Admin writes the <code>app:{clientId} admin user:&lt;id&gt;</code> tuple.
+        </p>
+        <input
+          type="text"
+          className="mono"
+          placeholder="Search username or email…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          aria-label="Search users"
+          style={{ maxWidth: 340 }}
+        />
+      </div>
+
+      {notice && <p className="ok-text" style={{ padding: "8px 16px 0" }}>{notice}</p>}
+      {error && <p className="error-text" style={{ padding: "8px 16px 0" }}>{error}</p>}
+
+      {users === null ? (
+        <div className="empty">Loading…</div>
+      ) : users.length === 0 ? (
+        <div className="empty">
+          {debounced ? "No users match your search." : "No users yet — they appear here after their first registration."}
+        </div>
+      ) : (
+        <table className="data">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Email</th>
+              <th>Created</th>
+              <th>Sessions</th>
+              <th>Status</th>
+              <th>Admin</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((u) => (
+              <UserRow
+                key={u.user_id}
+                user={u}
+                isAdmin={admins.has(u.user_id)}
+                expanded={expanded === u.user_id}
+                sessions={expanded === u.user_id ? sessions : null}
+                confirming={confirming?.user_id === u.user_id}
+                busy={busy}
+                onToggleSessions={() => toggleSessions(u.user_id)}
+                onRevokeAll={() => revokeAll(u.user_id)}
+                onToggleAdmin={() => toggleAdmin(u.user_id)}
+                onConfirmDeactivate={() => setConfirming(u)}
+                onCancelDeactivate={() => setConfirming(null)}
+                onSetActive={(active) => setActive(u, active)}
+              />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function UserRow({
+  user,
+  isAdmin,
+  expanded,
+  sessions,
+  confirming,
+  busy,
+  onToggleSessions,
+  onRevokeAll,
+  onToggleAdmin,
+  onConfirmDeactivate,
+  onCancelDeactivate,
+  onSetActive,
+}: {
+  user: AppUser;
+  isAdmin: boolean;
+  expanded: boolean;
+  sessions: UserSession[] | null;
+  confirming: boolean;
+  busy: boolean;
+  onToggleSessions: () => void;
+  onRevokeAll: () => void;
+  onToggleAdmin: () => void;
+  onConfirmDeactivate: () => void;
+  onCancelDeactivate: () => void;
+  onSetActive: (active: boolean) => void;
+}) {
+  return (
+    <>
+      <tr>
+        <td>
+          <strong>{user.username}</strong>{" "}
+          {user.scope === "org" && <span className="badge">org</span>}
+        </td>
+        <td className="mono">{user.email}</td>
+        <td>{user.created_at ? user.created_at.slice(0, 10) : "—"}</td>
+        <td>
+          <button className="btn secondary small" onClick={onToggleSessions} disabled={busy}>
+            {user.session_count} session{user.session_count === 1 ? "" : "s"}
+          </button>
+        </td>
+        <td>
+          <span className={`badge ${user.active ? "active" : "suspended"}`}>
+            {user.active ? "active" : "deactivated"}
+          </span>
+        </td>
+        <td>
+          <button
+            className={"btn small" + (isAdmin ? " danger" : " secondary")}
+            onClick={onToggleAdmin}
+            disabled={busy}
+            title={`${isAdmin ? "Deletes" : "Writes"} the tuple app:… admin user:${user.user_id}`}
+          >
+            {isAdmin ? "Remove admin" : "Make admin"}
+          </button>
+        </td>
+        <td style={{ textAlign: "right" }}>
+          {user.active ? (
+            confirming ? (
+              <>
+                <span className="error-text" style={{ marginRight: 8 }}>
+                  {user.scope === "org"
+                    ? "Org-scoped identity: this logs them out and blocks login on EVERY app in the org."
+                    : "This revokes all their sessions and blocks login."}
+                </span>
+                <button className="btn danger small" onClick={() => onSetActive(false)} disabled={busy}>
+                  Yes, deactivate
+                </button>{" "}
+                <button className="btn secondary small" onClick={onCancelDeactivate} disabled={busy}>
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button className="btn danger small" onClick={onConfirmDeactivate} disabled={busy}>
+                Deactivate
+              </button>
+            )
+          ) : (
+            <button className="btn secondary small" onClick={() => onSetActive(true)} disabled={busy}>
+              Reactivate
+            </button>
+          )}
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={7} style={{ background: "var(--surface-dim)" }}>
+            {sessions === null ? (
+              <span className="hint">Loading sessions…</span>
+            ) : sessions.length === 0 ? (
+              <span className="hint">No active sessions.</span>
+            ) : (
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                <ul style={{ listStyle: "none", padding: 0, margin: 0, flex: 1 }}>
+                  {sessions.map((s) => (
+                    <li key={s.session_id} style={{ marginBottom: 4 }}>
+                      <code className="idchip">{s.user_agent || "unknown device"}</code>{" "}
+                      <span className="hint">
+                        started {s.created_at ? s.created_at.slice(0, 16).replace("T", " ") : "—"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <button className="btn danger small" onClick={onRevokeAll} disabled={busy}>
+                  Revoke all sessions
+                </button>
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 

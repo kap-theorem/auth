@@ -9,6 +9,7 @@ import {
   ApiClient,
   ApiError,
   App,
+  AppUser,
   AuthzModel,
   CheckResult,
   Developer,
@@ -20,6 +21,8 @@ import {
   RelationTuple,
   TupleFilter,
   TupleKey,
+  UserScope,
+  UserSession,
 } from "./types";
 
 // ---------------------------------------------------------------- seed data
@@ -141,7 +144,15 @@ const tuples = new Map<string, RelationTuple[]>([
       t("problem", "two-sum", "viewer", "user", "banned", "deny"),
     ],
   ],
-  ["client_wordskali", [t("board", "daily", "owner", "user", "ada")]],
+  [
+    "client_wordskali",
+    [
+      t("board", "daily", "owner", "user", "ada"),
+      // u_kush is an app admin — the Users tab's Admin toggle reads/writes
+      // exactly this tuple shape.
+      t("app", "client_wordskali", "admin", "user", "u_kush"),
+    ],
+  ],
 ]);
 
 function t(
@@ -165,7 +176,84 @@ function t(
   };
 }
 
-// fake platform-wide counts for the metrics page (mock has no end users)
+// End users, scoped like the backend: scope 'app'/scope_id=client_id is an
+// app's own user base; scope 'org'/scope_id=org_id is the org's shared pool
+// (surfaced by every org-scoped app of that org).
+interface MockEndUser {
+  user_id: string;
+  username: string;
+  email: string;
+  created_at: string;
+  active: boolean;
+  scope_type: UserScope;
+  scope_id: string;
+}
+
+const endUsers: MockEndUser[] = [
+  // wordskali's own users. u_kush also holds the app-admin tuple (below).
+  {
+    user_id: "u_kush",
+    username: "kush",
+    email: "kush@example.com",
+    created_at: "2026-03-14T09:30:00Z",
+    active: true,
+    scope_type: "app",
+    scope_id: "client_wordskali",
+  },
+  {
+    user_id: "u_mina",
+    username: "mina",
+    email: "mina@example.com",
+    created_at: "2026-04-02T16:45:00Z",
+    active: true,
+    scope_type: "app",
+    scope_id: "client_wordskali",
+  },
+  {
+    user_id: "u_banned",
+    username: "banned",
+    email: "banned@example.com",
+    created_at: "2026-05-20T11:00:00Z",
+    active: false,
+    scope_type: "app",
+    scope_id: "client_wordskali",
+  },
+  // org_ada's shared pool — appears under dsapanicle (org-scoped app).
+  {
+    user_id: "u_priya",
+    username: "priya",
+    email: "priya@ada.dev",
+    created_at: "2026-05-01T08:15:00Z",
+    active: true,
+    scope_type: "org",
+    scope_id: "org_ada",
+  },
+];
+
+interface MockSession extends UserSession {
+  user_id: string;
+  client_id: string;
+}
+
+let mockSessions: MockSession[] = [
+  s("sess_1", "u_kush", "client_wordskali", "Firefox on macOS", "2026-07-15T09:00:00Z"),
+  s("sess_2", "u_kush", "client_wordskali", "Safari on iPhone", "2026-07-17T21:30:00Z"),
+  s("sess_3", "u_mina", "client_wordskali", "Chrome on Windows", "2026-07-16T13:10:00Z"),
+  s("sess_4", "u_priya", "client_dsapanicle", "Chrome on Android", "2026-07-18T07:45:00Z"),
+];
+
+function s(
+  session_id: string,
+  user_id: string,
+  client_id: string,
+  user_agent: string,
+  created_at: string
+): MockSession {
+  const expires = new Date(new Date(created_at).getTime() + 7 * 24 * 3600 * 1000);
+  return { session_id, user_id, client_id, user_agent, created_at, expires_at: expires.toISOString() };
+}
+
+// fake platform-wide counts for the metrics page (mock has few end users)
 const counters = { users: 12_840, active_sessions: 861 };
 
 // ------------------------------------------------------------- helpers
@@ -498,6 +586,80 @@ export class MockApiClient implements ApiClient {
       if (res.allowed) out.push(`${objectType}:${id}`);
     }
     return delay(out.sort());
+  }
+
+  // ---- app user management ----
+
+  private appEndUsers(app: App): MockEndUser[] {
+    return endUsers.filter(
+      (u) =>
+        (u.scope_type === "app" && u.scope_id === app.client_id) ||
+        (app.identity_scope === "org" && u.scope_type === "org" && u.scope_id === app.org_id)
+    );
+  }
+
+  private scopedUser(app: App, userId: string): MockEndUser {
+    const user = this.appEndUsers(app).find((u) => u.user_id === userId);
+    if (!user) throw new ApiError("User not found.");
+    return user;
+  }
+
+  async listAppUsers(clientId: string, query?: string): Promise<AppUser[]> {
+    const app = this.ownedApp(clientId);
+    let rows = this.appEndUsers(app);
+    if (query?.trim()) {
+      const q = query.trim().toLowerCase();
+      rows = rows.filter(
+        (u) => u.username.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+      );
+    }
+    return delay(
+      rows.map((u) => ({
+        user_id: u.user_id,
+        username: u.username,
+        email: u.email,
+        created_at: u.created_at,
+        active: u.active,
+        session_count: mockSessions.filter(
+          (ms) => ms.user_id === u.user_id && ms.client_id === clientId
+        ).length,
+        scope: u.scope_type,
+      }))
+    );
+  }
+
+  async listUserSessions(clientId: string, userId: string): Promise<UserSession[]> {
+    const app = this.ownedApp(clientId);
+    this.scopedUser(app, userId);
+    return delay(
+      mockSessions
+        .filter((ms) => ms.user_id === userId && ms.client_id === clientId)
+        .map(({ user_id: _u, client_id: _c, ...pub }) => pub)
+    );
+  }
+
+  async revokeUserSessions(clientId: string, userId: string): Promise<void> {
+    const app = this.ownedApp(clientId);
+    this.scopedUser(app, userId);
+    mockSessions = mockSessions.filter(
+      (ms) => !(ms.user_id === userId && ms.client_id === clientId)
+    );
+    return delay(undefined);
+  }
+
+  async setUserActive(clientId: string, userId: string, active: boolean): Promise<string> {
+    const app = this.ownedApp(clientId);
+    const user = this.scopedUser(app, userId);
+    user.active = active;
+    if (active) return delay("User reactivated; they can log in again");
+    // Deactivation disables the identity, so EVERY session dies — for
+    // org-scoped users that spans all of the org's apps.
+    mockSessions = mockSessions.filter((ms) => ms.user_id !== userId);
+    return delay(
+      user.scope_type === "org"
+        ? "User deactivated; this is an org-scoped identity, so they are disabled and logged out across ALL of the org's apps"
+        : "User deactivated; all of their sessions have been revoked"
+    );
   }
 
   // ---- superadmin ----

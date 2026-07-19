@@ -102,8 +102,12 @@ type User struct {
 	// ScopeType/ScopeID replace the former client_id column:
 	//   scope_type='app', scope_id=<client_id>  — app-scoped user base
 	//   scope_type='org', scope_id=<org_id>     — org-shared user pool (SSO)
-	ScopeType string         `gorm:"column:scope_type;size:8;not null;uniqueIndex:idx_users_email_scope" json:"scope_type"`
-	ScopeID   string         `gorm:"column:scope_id;size:36;not null;index;uniqueIndex:idx_users_email_scope" json:"scope_id"`
+	ScopeType string `gorm:"column:scope_type;size:8;not null;uniqueIndex:idx_users_email_scope" json:"scope_type"`
+	ScopeID   string `gorm:"column:scope_id;size:36;not null;index;uniqueIndex:idx_users_email_scope" json:"scope_id"`
+	// Deactivated users cannot log in through ANY flow and their tokens stop
+	// validating; soft delete (DeletedAt) stays reserved for real deletion.
+	// The column default keeps rows that predate the column active.
+	Active    bool           `gorm:"column:active;not null;default:true" json:"active"`
 	CreatedAt time.Time      `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`

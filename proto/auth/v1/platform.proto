@@ -92,6 +92,25 @@ service PlatformService {
   // the current one.
   rpc HostedLogoutAll(HostedLogoutAllRequest) returns (HostedLogoutAllResponse);
 
+  // App user management (spec "App user management", added 2026-07-19)
+  // All four RPCs take a developer token; the app must belong to the
+  // caller's org (or the caller must be a superadmin). "Users of the app"
+  // = app-scoped users (scope_type='app', scope_id=client_id) plus, when
+  // the app is org-scoped, the org's shared user pool — each row is
+  // labeled with its scope ("app" | "org").
+  // Lists an app's end users; query does a substring match on username or
+  // email.
+  rpc ListAppUsers(ListAppUsersRequest) returns (ListAppUsersResponse);
+  // Lists one user's active sessions under this app.
+  rpc ListUserSessionsAdmin(ListUserSessionsAdminRequest) returns (ListUserSessionsAdminResponse);
+  // Revokes ALL of one user's sessions under this app.
+  rpc RevokeUserSessionsAdmin(RevokeUserSessionsAdminRequest) returns (RevokeUserSessionsAdminResponse);
+  // Activates/deactivates a user. Deactivation revokes ALL of the user's
+  // sessions — across every client for org-scoped users, because the
+  // IDENTITY is disabled, not just its access to one app — and blocks
+  // every login flow until reactivation.
+  rpc SetUserActive(SetUserActiveRequest) returns (SetUserActiveResponse);
+
   // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
   rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
   rpc ListAllApps(ListAllAppsRequest) returns (ListAllAppsResponse);
@@ -432,6 +451,72 @@ message HostedLogoutAllRequest {
 message HostedLogoutAllResponse {
   bool success = 1;
   string message = 2;
+}
+
+// One end user of an app, as seen by its developer (never the password).
+message AppUser {
+  string user_id = 1;
+  string username = 2;
+  string email = 3;
+  google.protobuf.Timestamp created_at = 4;
+  bool active = 5;
+  // Active sessions the user holds under THIS client.
+  int32 session_count = 6;
+  // 'app' = the app's own user base; 'org' = the org's shared pool (only
+  // present for org-scoped apps). Deactivating an org user disables the
+  // identity across every app in the org.
+  string scope = 7;
+}
+
+message ListAppUsersRequest {
+  string access_token = 1;
+  string client_id = 2;
+  // Optional substring match on username OR email.
+  string query = 3;
+}
+
+message ListAppUsersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AppUser users = 3;
+}
+
+message ListUserSessionsAdminRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+}
+
+message ListUserSessionsAdminResponse {
+  bool success = 1;
+  string message = 2;
+  // `current` is always false here (the admin is not the session owner).
+  repeated SessionInfo sessions = 3;
+}
+
+message RevokeUserSessionsAdminRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+}
+
+message RevokeUserSessionsAdminResponse {
+  bool success = 1;
+  string message = 2;
+  int32 revoked_count = 3;
+}
+
+message SetUserActiveRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+  bool active = 4;
+}
+
+message SetUserActiveResponse {
+  bool success = 1;
+  string message = 2;
+  AppUser user = 3;
 }
 
 message ListAllOrgsRequest {
