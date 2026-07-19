@@ -9,7 +9,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -259,7 +261,28 @@ func appToProto(c *models.Client) *authv1.App {
 		IdentityScope: c.IdentityScope,
 		Suspended:     c.Suspended,
 		CreatedAt:     timestamppb.New(c.CreatedAt),
+		RedirectUris:  c.GetRedirectURIs(),
 	}
+}
+
+// normalizeRedirectURIs trims, drops empties, dedupes, and validates that
+// every whitelisted hosted-login redirect is an absolute URL.
+func normalizeRedirectURIs(uris []string) ([]string, error) {
+	out := make([]string, 0, len(uris))
+	for _, raw := range uris {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("redirect URI %q must be an absolute URL", u)
+		}
+		if !slices.Contains(out, u) {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }
 
 func validIdentityScope(scope string) bool {
@@ -639,6 +662,16 @@ func (s *PlatformServiceServerImpl) UpdateApp(ctx context.Context, req *authv1.U
 		}
 		client.IdentityScope = *req.IdentityScope
 	}
+	if req.SetRedirectUris {
+		uris, uerr := normalizeRedirectURIs(req.RedirectUris)
+		if uerr != nil {
+			return fail(uerr.Error())
+		}
+		if serr := client.SetRedirectURIs(uris); serr != nil {
+			log.Printf("UpdateApp: redirect URI encoding failed for client %s: %v", req.ClientId, serr)
+			return fail("Internal server error")
+		}
+	}
 
 	if err := s.repo.UpdateClient(ctx, client); err != nil {
 		log.Printf("UpdateApp: update failed for client %s: %v", req.ClientId, err)
@@ -724,6 +757,79 @@ func (s *PlatformServiceServerImpl) DeleteApp(ctx context.Context, req *authv1.D
 }
 
 // ---------------------------------------------------------------------------
+// Hosted login (spec "Hosted login", added 2026-07-18)
+// ---------------------------------------------------------------------------
+
+// GetAppPublicInfo is UNAUTHENTICATED: it exposes only the app's display
+// name and whether hosted login is enabled. Unknown client ids yield
+// {success: false} and nothing else (no existence oracle beyond that).
+func (s *PlatformServiceServerImpl) GetAppPublicInfo(ctx context.Context, req *authv1.GetAppPublicInfoRequest) (*authv1.GetAppPublicInfoResponse, error) {
+	log.Printf("GetAppPublicInfo request received for client: %s", req.ClientId)
+
+	if req.ClientId == "" {
+		return &authv1.GetAppPublicInfoResponse{Success: false}, nil
+	}
+	client, err := s.repo.GetClientByID(ctx, req.ClientId)
+	if err != nil {
+		return &authv1.GetAppPublicInfoResponse{Success: false}, nil
+	}
+	return &authv1.GetAppPublicInfoResponse{
+		Success:            true,
+		Name:               client.ClientName,
+		HostedLoginEnabled: len(client.GetRedirectURIs()) > 0 && !client.Suspended,
+	}, nil
+}
+
+// HostedLogin is the client-secret-free login path behind the
+// platform-hosted login page. The redirect_uri whitelist is the trust
+// anchor: the call succeeds only when redirect_uri EXACTLY matches one of
+// the app's whitelisted redirect_uris (string equality, no prefix
+// matching) and the app is not suspended. Reuses the GetToken machinery
+// (identity scoping included); rate-limited by the interceptor with the
+// same per-email login limiter as GetToken.
+func (s *PlatformServiceServerImpl) HostedLogin(ctx context.Context, req *authv1.HostedLoginRequest) (*authv1.HostedLoginResponse, error) {
+	log.Printf("HostedLogin request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.HostedLoginResponse, error) {
+		return &authv1.HostedLoginResponse{Success: false, Message: msg}, nil
+	}
+
+	if req.ClientId == "" || req.Email == "" || req.Password == "" || req.RedirectUri == "" {
+		return fail("Email, password, client ID, and redirect URI are required")
+	}
+
+	client, err := s.repo.GetClientByID(ctx, req.ClientId)
+	if err != nil {
+		// Same generic message as every other rejection below: unknown app,
+		// suspended app, and unlisted redirect are indistinguishable.
+		return fail("Hosted login is not available for this app")
+	}
+	if client.Suspended {
+		log.Printf("HostedLogin rejected: client %s is suspended", client.ClientID)
+		return fail("Hosted login is not available for this app")
+	}
+	whitelist := client.GetRedirectURIs()
+	if len(whitelist) == 0 || !slices.Contains(whitelist, req.RedirectUri) {
+		log.Printf("HostedLogin rejected: redirect_uri not whitelisted (client: %s)", client.ClientID)
+		return fail("Hosted login is not available for this app")
+	}
+
+	resp, err := issueLoginTokens(ctx, s.repo, client, req.Email, req.Password, req.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	return &authv1.HostedLoginResponse{
+		Success:      resp.Success,
+		Message:      resp.Message,
+		AccessToken:  resp.AccessToken,
+		RefreshToken: resp.RefreshToken,
+		ExpiresAt:    resp.ExpiresAt,
+		User:         resp.User,
+		SessionId:    resp.SessionId,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Authorization (Phase 3 resolver)
 // ---------------------------------------------------------------------------
 
@@ -734,22 +840,35 @@ func (s *PlatformServiceServerImpl) Check(ctx context.Context, req *authv1.Check
 		return &authv1.CheckResponse{Allowed: false, Reason: reason}, nil
 	}
 
-	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
-	if err != nil {
-		return deny("invalid token")
-	}
+	var clientID string
+	if req.AccessToken == "" && req.ClientSecret != "" {
+		// Machine-to-machine alternative (spec "Hosted login"): client
+		// credentials authorize checks scoped to that client ONLY — the
+		// credential IS the scope, so a different client_id cannot be named.
+		client, err := authenticateClientCreds(ctx, s.repo, req.ClientId, req.ClientSecret)
+		if err != nil {
+			log.Printf("Check: client authentication failed for client %s: %v", req.ClientId, err)
+			return deny("invalid client credentials")
+		}
+		clientID = client.ClientID
+	} else {
+		dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+		if err != nil {
+			return deny("invalid token")
+		}
 
-	// Resolve the tuple scope: empty defaults to the platform client (the
-	// console's superadmin gate); any developer may query the platform
-	// scope, but per-app scopes require ownership (or superadmin).
-	clientID := req.ClientId
-	if clientID == "" {
-		clientID = PlatformClientID
-	}
-	if clientID != PlatformClientID {
-		if _, err := s.authorizeAppAccess(ctx, dev, clientID); err != nil {
-			log.Printf("Check: ownership check failed for client %s (developer: %s): %v", clientID, dev.DeveloperID, err)
-			return deny("app not found")
+		// Resolve the tuple scope: empty defaults to the platform client (the
+		// console's superadmin gate); any developer may query the platform
+		// scope, but per-app scopes require ownership (or superadmin).
+		clientID = req.ClientId
+		if clientID == "" {
+			clientID = PlatformClientID
+		}
+		if clientID != PlatformClientID {
+			if _, err := s.authorizeAppAccess(ctx, dev, clientID); err != nil {
+				log.Printf("Check: ownership check failed for client %s (developer: %s): %v", clientID, dev.DeveloperID, err)
+				return deny("app not found")
+			}
 		}
 	}
 
@@ -916,15 +1035,28 @@ func (s *PlatformServiceServerImpl) ListTuples(ctx context.Context, req *authv1.
 		return &authv1.ListTuplesResponse{Success: false, Message: msg}, nil
 	}
 
-	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
-	if err != nil {
-		log.Printf("ListTuples: developer authentication failed: %v", err)
-		return fail("Invalid token")
-	}
-	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
-	if err != nil {
-		log.Printf("ListTuples: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
-		return fail("App not found")
+	var client *models.Client
+	if req.AccessToken == "" && req.ClientSecret != "" {
+		// Machine-to-machine alternative (spec "Hosted login"): client
+		// credentials list that client's OWN tuples only — the credential IS
+		// the scope, so a different client_id cannot be named.
+		c, err := authenticateClientCreds(ctx, s.repo, req.ClientId, req.ClientSecret)
+		if err != nil {
+			log.Printf("ListTuples: client authentication failed for client %s: %v", req.ClientId, err)
+			return fail("Invalid client credentials")
+		}
+		client = c
+	} else {
+		dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+		if err != nil {
+			log.Printf("ListTuples: developer authentication failed: %v", err)
+			return fail("Invalid token")
+		}
+		client, err = s.authorizeAppAccess(ctx, dev, req.ClientId)
+		if err != nil {
+			log.Printf("ListTuples: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+			return fail("App not found")
+		}
 	}
 
 	filter := req.Filter

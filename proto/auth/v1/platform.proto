@@ -6,6 +6,7 @@ package auth.v1;
 option go_package = "./proto/auth/v1";
 
 import "google/protobuf/timestamp.proto";
+import "proto/auth/v1/auth.proto";
 
 // PlatformService is the Phase 2 tenant-management + minimal authz surface.
 // Developers are users of the built-in "platform" client (dogfooding the
@@ -62,6 +63,17 @@ service PlatformService {
   // Returns the latest version of an app's authz model
   rpc GetAuthzModel(GetAuthzModelRequest) returns (GetAuthzModelResponse);
 
+  // Hosted login (spec "Hosted login", added 2026-07-18)
+  // Public app metadata for the hosted login page. NO auth: returns only
+  // {success, name, hosted_login_enabled} and never anything else.
+  rpc GetAppPublicInfo(GetAppPublicInfoRequest) returns (GetAppPublicInfoResponse);
+  // Client-secret-free end-user login for the platform-hosted login page.
+  // Succeeds only when redirect_uri EXACTLY matches one of the app's
+  // whitelisted redirect_uris (the whitelist is the trust anchor) and the
+  // app is not suspended. Same response shape as AuthService.GetToken;
+  // rate-limited with the same per-email login limiter as GetToken.
+  rpc HostedLogin(HostedLoginRequest) returns (HostedLoginResponse);
+
   // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
   rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
   rpc ListAllApps(ListAllAppsRequest) returns (ListAllAppsResponse);
@@ -79,6 +91,9 @@ message App {
   string identity_scope = 4; // 'app' | 'org'
   bool suspended = 5;
   google.protobuf.Timestamp created_at = 6;
+  // Exact redirect URIs whitelisted for hosted login. Empty = hosted login
+  // disabled.
+  repeated string redirect_uris = 7;
 }
 
 message Developer {
@@ -161,6 +176,11 @@ message UpdateAppRequest {
   string client_id = 2;
   optional string name = 3;           // unset = unchanged
   optional string identity_scope = 4; // unset = unchanged
+  // Full replacement hosted-login redirect whitelist, applied only when
+  // set_redirect_uris is true (repeated fields cannot express "unset";
+  // an empty list with the flag set disables hosted login).
+  repeated string redirect_uris = 5;
+  bool set_redirect_uris = 6;
 }
 
 message UpdateAppResponse {
@@ -201,6 +221,10 @@ message CheckRequest {
   // (used by the console's superadmin gate). Non-platform scopes require
   // the calling developer to own the app (or be a superadmin).
   string client_id = 7;
+  // Machine-to-machine alternative to access_token: when access_token is
+  // empty and client_id + client_secret are valid, the check is authorized
+  // scoped to that client only (it cannot name a different client_id scope).
+  string client_secret = 8;
 }
 
 message CheckResponse {
@@ -272,6 +296,10 @@ message ListTuplesRequest {
   string access_token = 1;
   string client_id = 2;
   TupleFilter filter = 3;
+  // Machine-to-machine alternative to access_token: when access_token is
+  // empty and client_id + client_secret are valid, the call is authorized
+  // scoped to that client's own tuples only.
+  string client_secret = 4;
 }
 
 message ListTuplesResponse {
@@ -302,6 +330,39 @@ message GetAuthzModelResponse {
   string message = 2;
   string model_json = 3;
   int32 version = 4;
+}
+
+// Public (unauthenticated) app info for the hosted login page. The response
+// deliberately carries nothing beyond {success, name, hosted_login_enabled}.
+message GetAppPublicInfoRequest {
+  string client_id = 1;
+}
+
+message GetAppPublicInfoResponse {
+  bool success = 1;
+  string name = 2;
+  bool hosted_login_enabled = 3;
+}
+
+message HostedLoginRequest {
+  string client_id = 1;
+  string email = 2;
+  string password = 3;
+  // Must EXACTLY equal one of the app's whitelisted redirect_uris (string
+  // equality, no prefix matching).
+  string redirect_uri = 4;
+  string user_agent = 5; // optional
+}
+
+// Same shape as AuthService.GetTokenResponse.
+message HostedLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
 }
 
 message ListAllOrgsRequest {

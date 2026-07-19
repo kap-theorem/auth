@@ -2,6 +2,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useAuth } from "./auth";
 import Layout from "./components/Layout";
 import Login from "./pages/Login";
+import HostedLogin from "./pages/HostedLogin";
 import Apps from "./pages/Apps";
 import AppDetail from "./pages/AppDetail";
 import Directory from "./pages/admin/Directory";
@@ -11,6 +12,17 @@ import Metrics from "./pages/admin/Metrics";
 export default function App() {
   const { session, isSuperadmin, ready } = useAuth();
   const location = useLocation();
+
+  // Public hosted-login page for consumer apps: no console session, minimal
+  // chrome, iframe-friendly (spec "Hosted login"). Rendered before every
+  // session gate so it works logged in, logged out, or embedded.
+  if (/^\/client\/[^/]+\/user\/login\/?$/.test(location.pathname)) {
+    return (
+      <Routes>
+        <Route path="/client/:clientId/user/login" element={<HostedLogin />} />
+      </Routes>
+    );
+  }
 
   if (!ready) return null;
 

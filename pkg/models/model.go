@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"gorm.io/gorm"
@@ -54,10 +55,42 @@ type Client struct {
 	// the org's shared user pool (SSO at the identity level).
 	IdentityScope string `gorm:"column:identity_scope;size:8;not null;default:app" json:"identity_scope"`
 	// Suspended clients fail all RPC authentication.
-	Suspended bool           `gorm:"column:suspended;not null;default:false" json:"suspended"`
-	CreatedAt time.Time      `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
-	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+	Suspended bool `gorm:"column:suspended;not null;default:false" json:"suspended"`
+	// JSON-encoded list of exact redirect URIs whitelisted for hosted login
+	// (spec "Hosted login"). Empty = hosted login disabled. Use
+	// GetRedirectURIs/SetRedirectURIs.
+	RedirectURIs string         `gorm:"column:redirect_uris;type:text" json:"-"`
+	CreatedAt    time.Time      `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt    time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
+	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// GetRedirectURIs decodes the hosted-login redirect whitelist. A missing or
+// unparseable column degrades to nil (hosted login disabled — fail closed).
+func (c *Client) GetRedirectURIs() []string {
+	if c.RedirectURIs == "" {
+		return nil
+	}
+	var uris []string
+	if err := json.Unmarshal([]byte(c.RedirectURIs), &uris); err != nil {
+		return nil
+	}
+	return uris
+}
+
+// SetRedirectURIs stores the hosted-login redirect whitelist. An empty list
+// clears the column (hosted login disabled).
+func (c *Client) SetRedirectURIs(uris []string) error {
+	if len(uris) == 0 {
+		c.RedirectURIs = ""
+		return nil
+	}
+	encoded, err := json.Marshal(uris)
+	if err != nil {
+		return err
+	}
+	c.RedirectURIs = string(encoded)
+	return nil
 }
 
 type User struct {

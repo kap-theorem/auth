@@ -121,6 +121,11 @@ function CredentialsTab({ app, onChange }: { app: App; onChange: (a: App) => voi
       setSecret(client_secret);
     });
 
+  const saveRedirects = (uris: string[]) =>
+    run(async () => {
+      onChange(await api.updateApp(app.client_id, { redirect_uris: uris }));
+    });
+
   const remove = () =>
     run(async () => {
       await api.deleteApp(app.client_id);
@@ -146,6 +151,8 @@ function CredentialsTab({ app, onChange }: { app: App; onChange: (a: App) => voi
         </button>
         <p className="hint">Rotation invalidates the old secret immediately; the new one is shown once.</p>
       </div>
+
+      <RedirectUrisCard app={app} busy={busy} onSave={saveRedirects} />
 
       <form className="card" onSubmit={saveName}>
         <h2>Settings</h2>
@@ -211,6 +218,99 @@ function CredentialsTab({ app, onChange }: { app: App; onChange: (a: App) => voi
         />
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------- hosted login redirects
+
+function RedirectUrisCard({
+  app,
+  busy,
+  onSave,
+}: {
+  app: App;
+  busy: boolean;
+  onSave: (uris: string[]) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const uris = app.redirect_uris;
+
+  const add = (e: FormEvent) => {
+    e.preventDefault();
+    setDraftError(null);
+    const uri = draft.trim();
+    let origin: URL;
+    try {
+      origin = new URL(uri);
+    } catch {
+      setDraftError("Enter an absolute URL, e.g. https://app.example.com/auth/callback.");
+      return;
+    }
+    if (!origin.protocol || !origin.host) {
+      setDraftError("Enter an absolute URL, e.g. https://app.example.com/auth/callback.");
+      return;
+    }
+    if (uris.includes(uri)) {
+      setDraftError("That URI is already whitelisted.");
+      return;
+    }
+    setDraft("");
+    onSave([...uris, uri]);
+  };
+
+  const remove = (uri: string) => onSave(uris.filter((u) => u !== uri));
+
+  return (
+    <div className="card">
+      <h2>Hosted login</h2>
+      <p className="card-sub">
+        Whitelist the exact redirect URIs allowed to use the platform-hosted login page
+        at <code>/client/{app.client_id}/user/login</code>. Matching is exact string
+        equality — no prefixes, no wildcards. An empty list disables hosted login.
+      </p>
+      {uris.length === 0 ? (
+        <p className="hint">No redirect URIs — hosted login is disabled for this app.</p>
+      ) : (
+        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 12px" }}>
+          {uris.map((uri) => (
+            <li
+              key={uri}
+              style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}
+            >
+              <code className="idchip" style={{ flex: 1, overflowWrap: "anywhere" }}>
+                {uri}
+              </code>
+              <button
+                type="button"
+                className="btn danger small"
+                onClick={() => remove(uri)}
+                disabled={busy}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={add} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+        <label className="field" style={{ flex: 1, maxWidth: 420 }}>
+          <span>Add redirect URI</span>
+          <input
+            type="text"
+            className="mono"
+            placeholder="https://app.example.com/auth/callback"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            required
+          />
+        </label>
+        <button className="btn secondary" disabled={busy} style={{ marginTop: 22 }}>
+          Add
+        </button>
+      </form>
+      {draftError && <p className="error-text">{draftError}</p>}
+    </div>
   );
 }
 

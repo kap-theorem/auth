@@ -43,6 +43,7 @@ interface WireApp {
   identityScope: IdentityScope;
   suspended?: boolean;
   createdAt?: string;
+  redirectUris?: string[];
 }
 
 interface WireTuple {
@@ -80,6 +81,7 @@ function mapApp(w: WireApp): App {
     identity_scope: w.identityScope,
     status: w.suspended ? "suspended" : "active",
     created_at: w.createdAt ?? "",
+    redirect_uris: w.redirectUris ?? [],
   };
 }
 
@@ -358,13 +360,18 @@ export class RealApiClient implements ApiClient {
 
   async updateApp(
     clientId: string,
-    patch: { name?: string; identity_scope?: IdentityScope }
+    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
   ): Promise<App> {
     const r = await this.post<{ app: WireApp }>("UpdateApp", {
       accessToken: this.token(),
       clientId,
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.identity_scope !== undefined ? { identityScope: patch.identity_scope } : {}),
+      // Repeated fields cannot express "unset": the flag tells the backend
+      // to replace the whitelist (empty list disables hosted login).
+      ...(patch.redirect_uris !== undefined
+        ? { redirectUris: patch.redirect_uris, setRedirectUris: true }
+        : {}),
     });
     return mapApp(r.app);
   }

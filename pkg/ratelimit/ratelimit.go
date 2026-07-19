@@ -103,7 +103,9 @@ func (r *RateLimiter) Check(fullMethod string, req interface{}) error {
 	}
 
 	switch {
-	case strings.HasSuffix(fullMethod, "/GetToken"):
+	// HostedLogin is a client-secret-free login path; it shares GetToken's
+	// per-email/per-client login limiter (same buckets).
+	case strings.HasSuffix(fullMethod, "/GetToken"), strings.HasSuffix(fullMethod, "/HostedLogin"):
 		email := ""
 		if e, ok := req.(emailer); ok {
 			email = e.GetEmail()

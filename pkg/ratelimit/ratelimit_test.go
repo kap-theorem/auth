@@ -92,6 +92,41 @@ func TestRateLimiter_LoginPerEmailPerClient(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_HostedLoginSharesLoginLimiter(t *testing.T) {
+	r := NewRateLimiter()
+	hosted := "/auth.v1.PlatformService/HostedLogin"
+	req := func(clientID, email string) *authv1.HostedLoginRequest {
+		return &authv1.HostedLoginRequest{ClientId: clientID, Email: email}
+	}
+
+	// HostedLogin is limited per client|email like GetToken...
+	for i := 0; i < 5; i++ {
+		if err := r.Check(hosted, req("client-a", "alice@example.com")); err != nil {
+			t.Fatalf("hosted login attempt %d should pass: %v", i+1, err)
+		}
+	}
+	err := r.Check(hosted, req("client-a", "alice@example.com"))
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted on 6th hosted login attempt, got %v", err)
+	}
+
+	// ...sharing the SAME buckets: GetToken for the same pair is also spent.
+	err = r.Check("/auth.v1.AuthService/GetToken", &authv1.GetTokenRequest{
+		ClientId: "client-a", Email: "alice@example.com",
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected GetToken to share the exhausted login bucket, got %v", err)
+	}
+
+	// Different email or client is unaffected.
+	if err := r.Check(hosted, req("client-a", "bob@example.com")); err != nil {
+		t.Fatalf("different email should not be rate limited: %v", err)
+	}
+	if err := r.Check(hosted, req("client-b", "alice@example.com")); err != nil {
+		t.Fatalf("different client should not be rate limited: %v", err)
+	}
+}
+
 func TestRateLimiter_RegistrationPerClient(t *testing.T) {
 	r := NewRateLimiter()
 	method := "/auth.v1.AuthService/RegisterUser"

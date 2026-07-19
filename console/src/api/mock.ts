@@ -69,6 +69,7 @@ const apps: App[] = [
     identity_scope: "org",
     status: "active",
     created_at: "2026-01-05T09:00:00Z",
+    redirect_uris: [],
   },
   {
     client_id: "client_wordskali",
@@ -77,6 +78,7 @@ const apps: App[] = [
     identity_scope: "app",
     status: "active",
     created_at: "2026-02-11T14:25:00Z",
+    redirect_uris: ["https://wordskali.example.dev/auth/callback"],
   },
   {
     client_id: "client_dsapanicle",
@@ -85,6 +87,7 @@ const apps: App[] = [
     identity_scope: "org",
     status: "active",
     created_at: "2026-04-19T08:12:00Z",
+    redirect_uris: [],
   },
   {
     client_id: "client_helioscan",
@@ -93,6 +96,7 @@ const apps: App[] = [
     identity_scope: "app",
     status: "suspended",
     created_at: "2026-03-02T10:10:00Z",
+    redirect_uris: [],
   },
 ];
 
@@ -325,6 +329,7 @@ export class MockApiClient implements ApiClient {
       identity_scope: identityScope,
       status: "active",
       created_at: now(),
+      redirect_uris: [],
     };
     apps.push(app);
     return delay({ app: { ...app }, client_secret: randomSecret() });
@@ -337,14 +342,19 @@ export class MockApiClient implements ApiClient {
     return app;
   }
 
-  async updateApp(clientId: string, patch: { name?: string; identity_scope?: IdentityScope }): Promise<App> {
+  async updateApp(
+    clientId: string,
+    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
+  ): Promise<App> {
     const app = this.ownedApp(clientId);
     if (patch.name !== undefined) {
       if (!patch.name.trim()) return fail("App name is required.");
       app.name = patch.name.trim();
     }
     if (patch.identity_scope !== undefined) app.identity_scope = patch.identity_scope;
-    return delay({ ...app });
+    if (patch.redirect_uris !== undefined)
+      app.redirect_uris = patch.redirect_uris.map((u) => u.trim()).filter(Boolean);
+    return delay({ ...app, redirect_uris: [...app.redirect_uris] });
   }
 
   async rotateAppSecret(clientId: string) {

@@ -35,10 +35,17 @@ func NewAuthServiceServer(db *gorm.DB) *AuthServiceServerImpl {
 // HealthCheck and the ADMIN_SECRET-gated client management RPCs) must call
 // this first. Suspended clients fail all RPC authentication.
 func (s *AuthServiceServerImpl) authenticateClient(ctx context.Context, clientID, clientSecret string) (*models.Client, error) {
+	return authenticateClientCreds(ctx, s.repo, clientID, clientSecret)
+}
+
+// authenticateClientCreds is the shared client-credential check, also used
+// by PlatformService's machine RPC paths (Check/ListTuples with client
+// credentials instead of a developer token).
+func authenticateClientCreds(ctx context.Context, repo *repository.AuthRepository, clientID, clientSecret string) (*models.Client, error) {
 	if clientID == "" || clientSecret == "" {
 		return nil, fmt.Errorf("missing client credentials")
 	}
-	client, err := s.repo.GetClientByID(ctx, clientID)
+	client, err := repo.GetClientByID(ctx, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("client lookup failed: %w", err)
 	}
@@ -189,12 +196,22 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
+	return issueLoginTokens(ctx, s.repo, client, req.Email, req.Password, req.UserAgent)
+}
+
+// issueLoginTokens is the shared end-user login machinery used by GetToken
+// and PlatformService.HostedLogin: resolves the user within the client's
+// identity scope, verifies the password, creates a session (multi-session:
+// one row per login/device), and returns the token pair + profile. The
+// caller must already have established trust in the client (client secret
+// for GetToken; the redirect_uri whitelist for HostedLogin).
+func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, client *models.Client, email, password, userAgent string) (*authv1.GetTokenResponse, error) {
 	// Resolve the user within the client's identity scope (app-scoped
 	// clients have their own users; org-scoped clients share the org pool)
 	scopeType, scopeID := userScope(client)
-	user, err := s.repo.GetUserByEmail(ctx, req.Email, scopeType, scopeID)
+	user, err := repo.GetUserByEmail(ctx, email, scopeType, scopeID)
 	if err != nil {
-		log.Printf("Login failed for client %s: user lookup error", req.ClientId)
+		log.Printf("Login failed for client %s: user lookup error", client.ClientID)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -202,8 +219,8 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	}
 
 	// Verify password
-	if !utils.CheckPasswordHash(req.Password, user.Password) {
-		log.Printf("Login failed for user %s (client: %s)", user.UserID, req.ClientId)
+	if !utils.CheckPasswordHash(password, user.Password) {
+		log.Printf("Login failed for user %s (client: %s)", user.UserID, client.ClientID)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
@@ -224,13 +241,13 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	session := &models.Session{
 		SessionID:        sessionID,
 		UserID:           user.UserID,
-		ClientID:         req.ClientId,
+		ClientID:         client.ClientID,
 		RefreshTokenHash: refreshHash,
-		UserAgent:        req.UserAgent,
+		UserAgent:        userAgent,
 		ExpiresAt:        time.Now().Add(refreshTokenLifetime),
 	}
 
-	if err := s.repo.CreateSession(ctx, session); err != nil {
+	if err := repo.CreateSession(ctx, session); err != nil {
 		log.Printf("Error creating session: %v", err)
 		return &authv1.GetTokenResponse{
 			Success: false,
@@ -239,7 +256,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	}
 
 	// Generate JWT access token (sub, client_id, session_id)
-	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, req.ClientId, sessionID)
+	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, client.ClientID, sessionID)
 	if err != nil {
 		log.Printf("Error generating JWT token: %v", err)
 		return &authv1.GetTokenResponse{
@@ -252,7 +269,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		UserId:    user.UserID,
 		Username:  user.UserName,
 		Email:     user.Email,
-		ClientId:  req.ClientId,
+		ClientId:  client.ClientID,
 		CreatedAt: timestamppb.New(user.CreatedAt),
 	}
 

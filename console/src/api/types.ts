@@ -27,6 +27,8 @@ export interface App {
   identity_scope: IdentityScope;
   status: ClientStatus;
   created_at: string;
+  /** Exact redirect URIs whitelisted for hosted login. Empty = disabled. */
+  redirect_uris: string[];
 }
 
 export interface AuthzModel {
@@ -103,7 +105,7 @@ export interface ApiClient {
   listApps(): Promise<App[]>;
   updateApp(
     clientId: string,
-    patch: { name?: string; identity_scope?: IdentityScope }
+    patch: { name?: string; identity_scope?: IdentityScope; redirect_uris?: string[] }
   ): Promise<App>;
   rotateAppSecret(clientId: string): Promise<{ client_secret: string }>;
   deleteApp(clientId: string): Promise<void>;
