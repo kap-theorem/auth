@@ -3,6 +3,7 @@ import { useAuth } from "./auth";
 import Layout from "./components/Layout";
 import Login from "./pages/Login";
 import HostedLogin from "./pages/HostedLogin";
+import HostedProfile from "./pages/HostedProfile";
 import Apps from "./pages/Apps";
 import AppDetail from "./pages/AppDetail";
 import Directory from "./pages/admin/Directory";
@@ -20,6 +21,17 @@ export default function App() {
     return (
       <Routes>
         <Route path="/client/:clientId/user/login" element={<HostedLogin />} />
+      </Routes>
+    );
+  }
+
+  // Public hosted account page (spec "Hosted account page"): the end user
+  // manages their own profile/sessions/password, authenticated purely by
+  // their access token. Same pre-gate placement as the hosted login route.
+  if (/^\/client\/[^/]+\/user\/profile\/?$/.test(location.pathname)) {
+    return (
+      <Routes>
+        <Route path="/client/:clientId/user/profile" element={<HostedProfile />} />
       </Routes>
     );
   }

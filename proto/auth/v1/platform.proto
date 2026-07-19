@@ -74,6 +74,24 @@ service PlatformService {
   // rate-limited with the same per-email login limiter as GetToken.
   rpc HostedLogin(HostedLoginRequest) returns (HostedLoginResponse);
 
+  // Hosted account page (spec "Hosted account page", added 2026-07-18)
+  // All four RPCs are authenticated purely by the END USER's access token
+  // (no client secret in the browser) and enforce BOTH: the token's
+  // client_id equals the request's client_id, AND hosted pages are enabled
+  // for the app (redirect whitelist non-empty, not suspended). Rate-limited
+  // by the per-client global ceiling (they carry client_id).
+  // Returns the token owner's profile and active sessions for this client.
+  rpc HostedGetProfile(HostedGetProfileRequest) returns (HostedGetProfileResponse);
+  // Same semantics as AuthService.ChangeUserPassword: verify the current
+  // password, >=8 chars policy, bcrypt; all OTHER sessions are invalidated
+  // (the caller's session stays alive).
+  rpc HostedChangePassword(HostedChangePasswordRequest) returns (HostedChangePasswordResponse);
+  // Revokes one of the token owner's OWN sessions under this client.
+  rpc HostedRevokeSession(HostedRevokeSessionRequest) returns (HostedRevokeSessionResponse);
+  // Revokes ALL of the token owner's sessions for this client, including
+  // the current one.
+  rpc HostedLogoutAll(HostedLogoutAllRequest) returns (HostedLogoutAllResponse);
+
   // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
   rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
   rpc ListAllApps(ListAllAppsRequest) returns (ListAllAppsResponse);
@@ -363,6 +381,57 @@ message HostedLoginResponse {
   google.protobuf.Timestamp expires_at = 5;
   UserProfile user = 6;
   string session_id = 7;
+}
+
+// Hosted account page (spec "Hosted account page", added 2026-07-18).
+// Every request carries {client_id, access_token}: the token authenticates
+// the end user, the client_id names the app scope, and the server enforces
+// that they match and that hosted pages are enabled for the app.
+message HostedGetProfileRequest {
+  string client_id = 1;
+  string access_token = 2;
+}
+
+message HostedGetProfileResponse {
+  bool success = 1;
+  string message = 2;
+  UserProfile user = 3;
+  // The token owner's active sessions under this client; `current` marks
+  // the session the presented token belongs to.
+  repeated SessionInfo sessions = 4;
+}
+
+message HostedChangePasswordRequest {
+  string client_id = 1;
+  string access_token = 2;
+  string current_password = 3;
+  string new_password = 4;
+}
+
+message HostedChangePasswordResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HostedRevokeSessionRequest {
+  string client_id = 1;
+  string access_token = 2;
+  string session_id = 3; // must be one of the token owner's own sessions
+}
+
+message HostedRevokeSessionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HostedLogoutAllRequest {
+  string client_id = 1;
+  string access_token = 2;
+}
+
+message HostedLogoutAllResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message ListAllOrgsRequest {

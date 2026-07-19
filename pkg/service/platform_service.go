@@ -798,18 +798,14 @@ func (s *PlatformServiceServerImpl) HostedLogin(ctx context.Context, req *authv1
 		return fail("Email, password, client ID, and redirect URI are required")
 	}
 
-	client, err := s.repo.GetClientByID(ctx, req.ClientId)
+	client, err := s.hostedEnabledClient(ctx, req.ClientId)
 	if err != nil {
 		// Same generic message as every other rejection below: unknown app,
 		// suspended app, and unlisted redirect are indistinguishable.
+		log.Printf("HostedLogin rejected for client %s: %v", req.ClientId, err)
 		return fail("Hosted login is not available for this app")
 	}
-	if client.Suspended {
-		log.Printf("HostedLogin rejected: client %s is suspended", client.ClientID)
-		return fail("Hosted login is not available for this app")
-	}
-	whitelist := client.GetRedirectURIs()
-	if len(whitelist) == 0 || !slices.Contains(whitelist, req.RedirectUri) {
+	if !slices.Contains(client.GetRedirectURIs(), req.RedirectUri) {
 		log.Printf("HostedLogin rejected: redirect_uri not whitelisted (client: %s)", client.ClientID)
 		return fail("Hosted login is not available for this app")
 	}
@@ -827,6 +823,138 @@ func (s *PlatformServiceServerImpl) HostedLogin(ctx context.Context, req *authv1
 		User:         resp.User,
 		SessionId:    resp.SessionId,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Hosted account page (spec "Hosted account page", added 2026-07-18)
+// ---------------------------------------------------------------------------
+
+// hostedEnabledClient is the shared hosted-pages gate (HostedLogin and every
+// Hosted* account RPC): the app must exist, not be suspended, and have a
+// non-empty redirect whitelist — the whitelist is the hosted opt-in signal,
+// so hosted pages exist only for apps that opted in.
+func (s *PlatformServiceServerImpl) hostedEnabledClient(ctx context.Context, clientID string) (*models.Client, error) {
+	if clientID == "" {
+		return nil, fmt.Errorf("client_id is required")
+	}
+	client, err := s.repo.GetClientByID(ctx, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("app not found")
+	}
+	if client.Suspended {
+		return nil, fmt.Errorf("app is suspended")
+	}
+	if len(client.GetRedirectURIs()) == 0 {
+		return nil, fmt.Errorf("hosted pages are not enabled for this app")
+	}
+	return client, nil
+}
+
+// authenticateHostedUser gates a hosted account RPC: hosted pages enabled
+// for the app AND the end-user access token belongs to THIS client
+// (validateUserSessionToken enforces token client_id == request client_id
+// plus revocation-aware session validation).
+func (s *PlatformServiceServerImpl) authenticateHostedUser(ctx context.Context, clientID, accessToken string) (*utils.Claims, *models.Session, error) {
+	if _, err := s.hostedEnabledClient(ctx, clientID); err != nil {
+		return nil, nil, err
+	}
+	if accessToken == "" {
+		return nil, nil, fmt.Errorf("access token is required")
+	}
+	return validateUserSessionToken(ctx, s.repo, accessToken, clientID)
+}
+
+// HostedGetProfile returns the token owner's profile and active sessions
+// for this client. Authenticated purely by the end user's access token.
+func (s *PlatformServiceServerImpl) HostedGetProfile(ctx context.Context, req *authv1.HostedGetProfileRequest) (*authv1.HostedGetProfileResponse, error) {
+	log.Printf("HostedGetProfile request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.HostedGetProfileResponse, error) {
+		return &authv1.HostedGetProfileResponse{Success: false, Message: msg}, nil
+	}
+
+	claims, current, err := s.authenticateHostedUser(ctx, req.ClientId, req.AccessToken)
+	if err != nil {
+		log.Printf("HostedGetProfile rejected for client %s: %v", req.ClientId, err)
+		return fail("Not signed in")
+	}
+
+	user, err := s.repo.GetUserByID(ctx, claims.Subject)
+	if err != nil {
+		log.Printf("HostedGetProfile: user lookup failed: %v", err)
+		return fail("Not signed in")
+	}
+
+	sessions, err := listUserSessionInfos(ctx, s.repo, claims.Subject, req.ClientId, current.SessionID)
+	if err != nil {
+		log.Printf("HostedGetProfile: session listing failed for user %s: %v", claims.Subject, err)
+		return fail("Internal server error")
+	}
+
+	return &authv1.HostedGetProfileResponse{
+		Success: true,
+		Message: "Profile retrieved successfully",
+		User: &authv1.UserProfile{
+			UserId:    user.UserID,
+			Username:  user.UserName,
+			Email:     user.Email,
+			ClientId:  req.ClientId,
+			CreatedAt: timestamppb.New(user.CreatedAt),
+		},
+		Sessions: sessions,
+	}, nil
+}
+
+// HostedChangePassword changes the token owner's password with the same
+// semantics as AuthService.ChangeUserPassword: current password verified,
+// >=8 chars, bcrypt, all OTHER sessions invalidated (the caller's kept).
+func (s *PlatformServiceServerImpl) HostedChangePassword(ctx context.Context, req *authv1.HostedChangePasswordRequest) (*authv1.HostedChangePasswordResponse, error) {
+	log.Printf("HostedChangePassword request received for client: %s", req.ClientId)
+
+	claims, current, err := s.authenticateHostedUser(ctx, req.ClientId, req.AccessToken)
+	if err != nil {
+		log.Printf("HostedChangePassword rejected for client %s: %v", req.ClientId, err)
+		return &authv1.HostedChangePasswordResponse{Success: false, Message: "Not signed in"}, nil
+	}
+
+	ok, msg := changeUserPassword(ctx, s.repo, claims.Subject, current.SessionID, req.CurrentPassword, req.NewPassword)
+	return &authv1.HostedChangePasswordResponse{Success: ok, Message: msg}, nil
+}
+
+// HostedRevokeSession revokes one of the token owner's OWN sessions under
+// this client; anyone else's session id yields "Session not found".
+func (s *PlatformServiceServerImpl) HostedRevokeSession(ctx context.Context, req *authv1.HostedRevokeSessionRequest) (*authv1.HostedRevokeSessionResponse, error) {
+	log.Printf("HostedRevokeSession request received for client: %s", req.ClientId)
+
+	claims, _, err := s.authenticateHostedUser(ctx, req.ClientId, req.AccessToken)
+	if err != nil {
+		log.Printf("HostedRevokeSession rejected for client %s: %v", req.ClientId, err)
+		return &authv1.HostedRevokeSessionResponse{Success: false, Message: "Not signed in"}, nil
+	}
+
+	ok, msg := revokeOwnUserSession(ctx, s.repo, claims.Subject, req.ClientId, req.SessionId)
+	return &authv1.HostedRevokeSessionResponse{Success: ok, Message: msg}, nil
+}
+
+// HostedLogoutAll revokes ALL of the token owner's sessions for this client,
+// including the current one (the presented token dies with it).
+func (s *PlatformServiceServerImpl) HostedLogoutAll(ctx context.Context, req *authv1.HostedLogoutAllRequest) (*authv1.HostedLogoutAllResponse, error) {
+	log.Printf("HostedLogoutAll request received for client: %s", req.ClientId)
+
+	claims, _, err := s.authenticateHostedUser(ctx, req.ClientId, req.AccessToken)
+	if err != nil {
+		log.Printf("HostedLogoutAll rejected for client %s: %v", req.ClientId, err)
+		return &authv1.HostedLogoutAllResponse{Success: false, Message: "Not signed in"}, nil
+	}
+
+	revoked, err := s.repo.DeleteUserClientSessions(ctx, claims.Subject, req.ClientId)
+	if err != nil {
+		log.Printf("HostedLogoutAll: session deletion failed for user %s: %v", claims.Subject, err)
+		return &authv1.HostedLogoutAllResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	log.Printf("HostedLogoutAll: all sessions revoked for user %s (client: %s, count: %d)", claims.Subject, req.ClientId, revoked)
+	return &authv1.HostedLogoutAllResponse{Success: true, Message: "All sessions logged out"}, nil
 }
 
 // ---------------------------------------------------------------------------

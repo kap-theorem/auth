@@ -72,6 +72,15 @@ func userScope(client *models.Client) (scopeType, scopeID string) {
 // the claims plus the live session row. Fails if the session has been
 // revoked (revocation-aware validation).
 func (s *AuthServiceServerImpl) authenticateUserToken(ctx context.Context, accessToken, clientID string) (*utils.Claims, *models.Session, error) {
+	return validateUserSessionToken(ctx, s.repo, accessToken, clientID)
+}
+
+// validateUserSessionToken is the shared end-user token check, also used by
+// PlatformService's hosted account RPCs (where the browser holds only the
+// user's token, never a client secret): JWT signature/expiry, token
+// client_id == expected client_id, and a live (unrevoked) session matching
+// the claims.
+func validateUserSessionToken(ctx context.Context, repo *repository.AuthRepository, accessToken, clientID string) (*utils.Claims, *models.Session, error) {
 	claims, err := utils.ValidateJWTToken(accessToken)
 	if err != nil {
 		return nil, nil, fmt.Errorf("token validation failed: %w", err)
@@ -79,7 +88,7 @@ func (s *AuthServiceServerImpl) authenticateUserToken(ctx context.Context, acces
 	if claims.ClientID != clientID {
 		return nil, nil, fmt.Errorf("token client mismatch")
 	}
-	session, err := s.repo.GetSessionByID(ctx, claims.SessionID)
+	session, err := repo.GetSessionByID(ctx, claims.SessionID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session lookup failed: %w", err)
 	}
@@ -87,6 +96,93 @@ func (s *AuthServiceServerImpl) authenticateUserToken(ctx context.Context, acces
 		return nil, nil, fmt.Errorf("session does not match token claims")
 	}
 	return claims, session, nil
+}
+
+// listUserSessionInfos returns a user's active sessions under a client as
+// proto SessionInfo rows, marking currentSessionID. Shared by
+// AuthService.GetUserSessions and PlatformService.HostedGetProfile.
+func listUserSessionInfos(ctx context.Context, repo *repository.AuthRepository, userID, clientID, currentSessionID string) ([]*authv1.SessionInfo, error) {
+	sessions, err := repo.GetSessionsByUserAndClient(ctx, userID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]*authv1.SessionInfo, 0, len(sessions))
+	for _, sess := range sessions {
+		infos = append(infos, &authv1.SessionInfo{
+			SessionId: sess.SessionID,
+			UserAgent: sess.UserAgent,
+			CreatedAt: timestamppb.New(sess.CreatedAt),
+			ExpiresAt: timestamppb.New(sess.ExpiresAt),
+			Current:   sess.SessionID == currentSessionID,
+		})
+	}
+	return infos, nil
+}
+
+// changeUserPassword is the shared password-change core (AuthService.
+// ChangeUserPassword and PlatformService.HostedChangePassword): verifies the
+// current password, applies the >=8 chars policy, stores a bcrypt hash, and
+// invalidates all OTHER sessions — the caller's session stays alive. Returns
+// (success, user-facing message).
+func changeUserPassword(ctx context.Context, repo *repository.AuthRepository, userID, keepSessionID, currentPassword, newPassword string) (bool, string) {
+	if currentPassword == "" || newPassword == "" {
+		return false, "Current password and new password are required"
+	}
+	// Same policy as registration
+	if len(newPassword) < 8 {
+		return false, "Password must be at least 8 characters long"
+	}
+
+	user, err := repo.GetUserByID(ctx, userID)
+	if err != nil {
+		log.Printf("changeUserPassword: error getting user by ID: %v", err)
+		return false, "Invalid access token"
+	}
+
+	if !utils.CheckPasswordHash(currentPassword, user.Password) {
+		return false, "Current password is incorrect"
+	}
+
+	hashedNewPassword, err := utils.HashPassword(newPassword)
+	if err != nil {
+		log.Printf("changeUserPassword: error hashing new password: %v", err)
+		return false, "Internal server error"
+	}
+
+	user.Password = hashedNewPassword
+	if err := repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("changeUserPassword: error updating user password: %v", err)
+		return false, "Internal server error"
+	}
+
+	// Invalidate all OTHER sessions; the current session stays alive
+	if err := repo.DeleteOtherUserSessions(ctx, user.UserID, keepSessionID); err != nil {
+		log.Printf("changeUserPassword: error invalidating other user sessions: %v", err)
+		return false, "Password changed but failed to invalidate other sessions"
+	}
+
+	log.Printf("Password changed successfully for user: %s", user.UserID)
+	return true, "Password changed successfully. Other sessions have been logged out."
+}
+
+// revokeOwnUserSession deletes one of the token owner's own sessions under a
+// client. Sessions belonging to another user or client are reported as "not
+// found" (no existence oracle). Shared by AuthService.RevokeSession and
+// PlatformService.HostedRevokeSession.
+func revokeOwnUserSession(ctx context.Context, repo *repository.AuthRepository, userID, clientID, sessionID string) (bool, string) {
+	if sessionID == "" {
+		return false, "Session ID is required"
+	}
+	target, err := repo.GetSessionByID(ctx, sessionID)
+	if err != nil || target.UserID != userID || target.ClientID != clientID {
+		return false, "Session not found"
+	}
+	if err := repo.DeleteSessionByID(ctx, target.SessionID); err != nil {
+		log.Printf("revokeOwnUserSession: error deleting session %s: %v", target.SessionID, err)
+		return false, "Internal server error"
+	}
+	log.Printf("Session revoked: %s (user: %s, client: %s)", target.SessionID, userID, clientID)
+	return true, "Session revoked successfully"
 }
 
 func (s *AuthServiceServerImpl) HealthCheck(ctx context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
@@ -557,24 +653,13 @@ func (s *AuthServiceServerImpl) GetUserSessions(ctx context.Context, req *authv1
 		}, nil
 	}
 
-	sessions, err := s.repo.GetSessionsByUserAndClient(ctx, claims.Subject, req.ClientId)
+	infos, err := listUserSessionInfos(ctx, s.repo, claims.Subject, req.ClientId, current.SessionID)
 	if err != nil {
 		log.Printf("Error listing sessions for user %s: %v", claims.Subject, err)
 		return &authv1.GetUserSessionsResponse{
 			Success: false,
 			Message: "Internal server error",
 		}, nil
-	}
-
-	infos := make([]*authv1.SessionInfo, 0, len(sessions))
-	for _, sess := range sessions {
-		infos = append(infos, &authv1.SessionInfo{
-			SessionId: sess.SessionID,
-			UserAgent: sess.UserAgent,
-			CreatedAt: timestamppb.New(sess.CreatedAt),
-			ExpiresAt: timestamppb.New(sess.ExpiresAt),
-			Current:   sess.SessionID == current.SessionID,
-		})
 	}
 
 	return &authv1.GetUserSessionsResponse{
@@ -613,26 +698,10 @@ func (s *AuthServiceServerImpl) RevokeSession(ctx context.Context, req *authv1.R
 	}
 
 	// The target session must belong to the token's user and client
-	target, err := s.repo.GetSessionByID(ctx, req.SessionId)
-	if err != nil || target.UserID != claims.Subject || target.ClientID != req.ClientId {
-		return &authv1.RevokeSessionResponse{
-			Success: false,
-			Message: "Session not found",
-		}, nil
-	}
-
-	if err := s.repo.DeleteSessionByID(ctx, target.SessionID); err != nil {
-		log.Printf("Error deleting session %s: %v", target.SessionID, err)
-		return &authv1.RevokeSessionResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	log.Printf("Session revoked: %s (user: %s, client: %s)", target.SessionID, claims.Subject, req.ClientId)
+	ok, msg := revokeOwnUserSession(ctx, s.repo, claims.Subject, req.ClientId, req.SessionId)
 	return &authv1.RevokeSessionResponse{
-		Success: true,
-		Message: "Session revoked successfully",
+		Success: ok,
+		Message: msg,
 	}, nil
 }
 
@@ -708,14 +777,6 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 		}, nil
 	}
 
-	// Same policy as registration
-	if len(req.NewPassword) < 8 {
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Password must be at least 8 characters long",
-		}, nil
-	}
-
 	// Authenticate client
 	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
@@ -735,57 +796,12 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 		}, nil
 	}
 
-	// Get user
-	user, err := s.repo.GetUserByID(ctx, claims.Subject)
-	if err != nil {
-		log.Printf("Error getting user by ID: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Invalid access token",
-		}, nil
-	}
-
-	// Verify current password
-	if !utils.CheckPasswordHash(req.CurrentPassword, user.Password) {
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Current password is incorrect",
-		}, nil
-	}
-
-	// Hash new password
-	hashedNewPassword, err := utils.HashPassword(req.NewPassword)
-	if err != nil {
-		log.Printf("Error hashing new password: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Update password
-	user.Password = hashedNewPassword
-	if err := s.repo.UpdateUser(ctx, user); err != nil {
-		log.Printf("Error updating user password: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Invalidate all OTHER sessions; the current session stays alive
-	if err := s.repo.DeleteOtherUserSessions(ctx, user.UserID, currentSession.SessionID); err != nil {
-		log.Printf("Error invalidating other user sessions: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Password changed but failed to invalidate other sessions",
-		}, nil
-	}
-
-	log.Printf("Password changed successfully for user: %s", user.UserID)
+	// Shared core: current-password check, >=8 policy, bcrypt, and
+	// invalidation of all OTHER sessions (the caller's stays alive).
+	ok, msg := changeUserPassword(ctx, s.repo, claims.Subject, currentSession.SessionID, req.CurrentPassword, req.NewPassword)
 	return &authv1.ChangeUserPasswordResponse{
-		Success: true,
-		Message: "Password changed successfully. Other sessions have been logged out.",
+		Success: ok,
+		Message: msg,
 	}, nil
 }
 

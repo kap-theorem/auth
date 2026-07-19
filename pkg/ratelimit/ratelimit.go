@@ -98,6 +98,11 @@ func (r *RateLimiter) Check(fullMethod string, req interface{}) error {
 		return nil // client authentication will reject the request anyway
 	}
 
+	// Any request carrying a client_id — including the hosted account RPCs
+	// (HostedGetProfile / HostedChangePassword / HostedRevokeSession /
+	// HostedLogoutAll) — is subject to the per-client global ceiling. Those
+	// methods need no per-email login limiter: they never take a password
+	// guess, only an already-issued access token.
 	if !r.global.Allow(clientID) {
 		return status.Error(codes.ResourceExhausted, "rate limit exceeded")
 	}

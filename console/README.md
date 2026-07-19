@@ -60,6 +60,63 @@ The vite dev server proxies `/auth.v1` → `http://localhost:8081`
   throws (no page calls it). The console's substring tuple filter is applied
   client-side on top of `ListTuples`.
 
+## Hosted account page
+
+Public iframe-friendly page where an app's end user manages their own
+account — no console session, no client secret in the browser (spec
+"Hosted account page"). Available only for apps with a non-empty hosted
+redirect whitelist (the hosted opt-in); the app must not be suspended.
+
+- **URL:** `/client/{client_id}/user/profile`
+- Talks directly to the real gateway (`HostedGetProfile`,
+  `HostedChangePassword`, `HostedRevokeSession`, `HostedLogoutAll`),
+  regardless of `VITE_API_MODE` — same as the hosted login page.
+- Sections: profile card (username, email), active sessions (user agent,
+  created, `current` badge, per-row revoke), change password (client-side
+  ≥8 check; on success other devices are signed out, the current session
+  stays), and "Sign out everywhere".
+
+### Token acquisition (priority order)
+
+1. **URL fragment:** open the page as
+   `/client/{client_id}/user/profile#access_token=<jwt>`. The fragment is
+   scrubbed from the address bar after being read.
+2. **postMessage handshake** (iframe embedding):
+   - on mount the page posts `{type: "PROFILE_READY"}` to `window.parent`
+     (targetOrigin `"*"` — carries no secret; the handshake exists to learn
+     the parent's origin);
+   - the embedding app replies with
+     `{type: "AUTH_TOKEN", access_token: "<jwt>"}` targeted at the iframe;
+   - the page validates `event.origin` is an http(s) origin and remembers
+     it — all later messages back to the parent are scoped to that origin.
+   - No token within ~2s → a friendly "not signed in" state.
+
+### LOGGED_OUT event
+
+After a successful "Sign out everywhere" (`HostedLogoutAll` revokes every
+session for this client, including the current one), the page posts
+`{type: "LOGGED_OUT"}` to the parent (verified handshake origin when
+available) so the host app can clear its own cookie and redirect.
+
+Embedding app snippet:
+
+```html
+<iframe id="account" src="https://auth.kaplabs.dev/client/CLIENT_ID/user/profile"></iframe>
+<script>
+  const frame = document.getElementById("account");
+  window.addEventListener("message", (e) => {
+    if (e.data?.type === "PROFILE_READY") {
+      frame.contentWindow.postMessage(
+        { type: "AUTH_TOKEN", access_token: myAccessToken },
+        new URL(frame.src).origin
+      );
+    } else if (e.data?.type === "LOGGED_OUT") {
+      // clear your session cookie, then redirect to your login page
+    }
+  });
+</script>
+```
+
 ## Demo logins (mock data)
 
 | Audience | Email | Password |
