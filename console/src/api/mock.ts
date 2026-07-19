@@ -161,8 +161,8 @@ function t(
   };
 }
 
-// fake 24h counters for the metrics page
-const counters = { logins_24h: 4182, checks_24h: 96_310, check_denies_24h: 7_413, errors_24h: 212, requests_24h: 118_540, active_sessions: 861 };
+// fake platform-wide counts for the metrics page (mock has no end users)
+const counters = { users: 12_840, active_sessions: 861 };
 
 // ------------------------------------------------------------- helpers
 
@@ -428,10 +428,7 @@ export class MockApiClient implements ApiClient {
     object: string,
     context: Record<string, string> = {}
   ): Promise<CheckResult> {
-    counters.checks_24h += 1;
-    const result = this.resolve(clientId, subject, relation.trim(), object, context, 0);
-    if (!result.allowed) counters.check_denies_24h += 1;
-    return delay(result);
+    return delay(this.resolve(clientId, subject, relation.trim(), object, context, 0));
   }
 
   private resolve(
@@ -535,15 +532,15 @@ export class MockApiClient implements ApiClient {
 
   async getPlatformMetrics(): Promise<PlatformMetrics> {
     this.requireSuperadmin();
+    let tupleCount = 0;
+    for (const rows of tuples.values()) tupleCount += rows.length;
     return delay({
       orgs: orgs.length,
       apps: apps.length,
       developers: developers.length,
+      users: counters.users,
       active_sessions: counters.active_sessions,
-      logins_24h: counters.logins_24h,
-      checks_24h: counters.checks_24h,
-      check_denies_24h: counters.check_denies_24h,
-      error_rate_24h: counters.errors_24h / counters.requests_24h,
+      tuples: tupleCount,
     });
   }
 }

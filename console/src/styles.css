@@ -119,6 +119,13 @@ h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
   border-radius: 999px;
   color: #cfe0ee;
 }
+.sidebar-footer .api-mode {
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.45);
+}
 
 .main {
   flex: 1;

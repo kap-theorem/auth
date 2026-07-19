@@ -1,5 +1,6 @@
 import { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
+import { apiMode } from "../api";
 import { useAuth } from "../auth";
 
 export default function Layout({ children }: { children: ReactNode }) {
@@ -41,6 +42,9 @@ export default function Layout({ children }: { children: ReactNode }) {
             <button className="btn secondary small" onClick={signOut}>
               Sign out
             </button>
+          </div>
+          <div className="api-mode" title={apiMode === "real" ? "Backend on :8081" : "In-memory mock data"}>
+            api: {apiMode}
           </div>
         </div>
       </aside>

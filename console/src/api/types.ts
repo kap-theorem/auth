@@ -62,15 +62,14 @@ export interface CheckResult {
   reason?: string;
 }
 
+/** Simple platform-wide counts (matches the backend contract's GetPlatformMetrics). */
 export interface PlatformMetrics {
   orgs: number;
   apps: number;
   developers: number;
+  users: number;
   active_sessions: number;
-  logins_24h: number;
-  checks_24h: number;
-  check_denies_24h: number;
-  error_rate_24h: number; // 0..1
+  tuples: number;
 }
 
 export interface TupleFilter {
@@ -79,9 +78,12 @@ export interface TupleFilter {
 }
 
 export class ApiError extends Error {
-  constructor(message: string) {
+  /** HTTP status when the failure came from the transport (real client only). */
+  readonly status?: number;
+  constructor(message: string, status?: number) {
     super(message);
     this.name = "ApiError";
+    this.status = status;
   }
 }
 
@@ -89,6 +91,10 @@ export interface ApiClient {
   // ---- Tenant management (§7) ----
   registerDeveloper(email: string, password: string): Promise<DeveloperSession>;
   developerLogin(email: string, password: string): Promise<DeveloperSession>;
+  /** Clear the local session (sessionStorage + memory). */
+  signOut(): void;
+  /** Synchronously restore a session persisted in sessionStorage, if any. */
+  restoreSession(): DeveloperSession | null;
 
   createApp(
     name: string,
