@@ -35,3 +35,5 @@ proto/auth/v1/*.pb.go
 
 server
 auth-server
+# Generated dev JWT signing keys
+*.pem

@@ -6,14 +6,17 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	database "authservice/internal/database"
+	"authservice/pkg/ratelimit"
 	"authservice/pkg/service"
 	authv1 "authservice/proto/auth/v1"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -30,9 +33,29 @@ func main() {
 	cleanupService := service.NewCleanupService(dbConnection.DB)
 	cleanupService.Start()
 
-	grpcserver := grpc.NewServer(
-		grpc.UnaryInterceptor(unaryInterceptor),
-	)
+	rateLimiter := ratelimit.NewRateLimiter()
+
+	serverOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(loggingInterceptor, rateLimiter.UnaryInterceptor()),
+	}
+
+	// TLS: required unless ENV=dev
+	certFile := os.Getenv("TLS_CERT_FILE")
+	keyFile := os.Getenv("TLS_KEY_FILE")
+	if certFile != "" && keyFile != "" {
+		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+		if err != nil {
+			log.Fatalf("Failed to load TLS credentials: %v", err)
+		}
+		serverOpts = append(serverOpts, grpc.Creds(creds))
+		log.Println("TLS enabled on listener")
+	} else if strings.EqualFold(os.Getenv("ENV"), "dev") {
+		log.Println("WARNING: ENV=dev, serving plaintext (no TLS)")
+	} else {
+		log.Fatal("TLS_CERT_FILE and TLS_KEY_FILE must be set (plaintext is only allowed when ENV=dev)")
+	}
+
+	grpcserver := grpc.NewServer(serverOpts...)
 	authv1.RegisterAuthServiceServer(grpcserver, service.NewAuthServiceServer(dbConnection.DB))
 
 	// Enable reflection for grpcurl
@@ -76,7 +99,7 @@ func main() {
 	dbConnection.Close()
 }
 
-func unaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func loggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	start := time.Now()
 
 	log.Printf("[RPC START] Method: %s, Time: %s", info.FullMethod, start.Format(time.RFC3339))

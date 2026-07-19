@@ -23,8 +23,12 @@ services:
     container_name: auth-service
     environment:
       DB_CONNECTION_STRING: authuser:authpassword@tcp(mysql:3306)/authdb?charset=utf8mb4&parseTime=True&loc=Local
-      JWT_SECRET: super-secure-jwt-secret-key-for-development-only
+      JWT_PRIVATE_KEY_FILE: /app/keys/jwt_private_key.pem
+      ADMIN_SECRET: dev-admin-secret-change-me
+      ENV: dev
       SERVER_PORT: 8080
+    volumes:
+      - jwt_keys:/app/keys
     ports:
       - "8080:8080"
     depends_on:
@@ -33,3 +37,4 @@ services:
 
 volumes:
   mysql_data:
+  jwt_keys:

@@ -21,9 +21,11 @@ func (r *AuthRepository) CreateUser(ctx context.Context, user *models.User) erro
 	return r.db.WithContext(ctx).Create(user).Error
 }
 
-func (r *AuthRepository) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+// GetUserByEmail resolves a user by email within a client scope
+// (email uniqueness is per client).
+func (r *AuthRepository) GetUserByEmail(ctx context.Context, email, clientID string) (*models.User, error) {
 	var user models.User
-	err := r.db.WithContext(ctx).Where("email = ?", email).First(&user).Error
+	err := r.db.WithContext(ctx).Where("email_id = ? AND client_id = ?", email, clientID).First(&user).Error
 	if err != nil {
 		return nil, err
 	}
@@ -61,53 +63,58 @@ func (r *AuthRepository) GetClientByID(ctx context.Context, clientID string) (*m
 	return &client, nil
 }
 
-func (r *AuthRepository) ValidateClient(ctx context.Context, clientID, clientSecret string) (*models.Client, error) {
-	var client models.Client
-	err := r.db.WithContext(ctx).Where("client_id = ? AND client_secret = ?", clientID, clientSecret).First(&client).Error
-	if err != nil {
-		return nil, err
-	}
-	return &client, nil
-}
-
-// UpdateClientSecret updates the client's secret value
-func (r *AuthRepository) UpdateClientSecret(ctx context.Context, clientID, newSecret string) error {
+// UpdateClientSecretHash updates the client's stored secret hash.
+func (r *AuthRepository) UpdateClientSecretHash(ctx context.Context, clientID, newSecretHash string) error {
 	return r.db.WithContext(ctx).
 		Model(&models.Client{}).
 		Where("client_id = ?", clientID).
-		Update("client_secret", newSecret).Error
+		Update("client_secret", newSecretHash).Error
 }
 
 // Session operations
-func (r *AuthRepository) CreateOrUpdateSession(ctx context.Context, session *models.Session) error {
-	// This will either create or update based on the composite primary key (UserId + ClientId)
+func (r *AuthRepository) CreateSession(ctx context.Context, session *models.Session) error {
+	return r.db.WithContext(ctx).Create(session).Error
+}
+
+func (r *AuthRepository) UpdateSession(ctx context.Context, session *models.Session) error {
 	return r.db.WithContext(ctx).Save(session).Error
 }
 
-func (r *AuthRepository) GetSessionByUserAndClient(ctx context.Context, userID, clientID string) (*models.Session, error) {
+func (r *AuthRepository) GetSessionByID(ctx context.Context, sessionID string) (*models.Session, error) {
 	var session models.Session
-	err := r.db.WithContext(ctx).Where("user_id = ? AND client_id = ? AND expires_at > ?", userID, clientID, time.Now()).First(&session).Error
+	err := r.db.WithContext(ctx).Where("session_id = ? AND expires_at > ?", sessionID, time.Now()).First(&session).Error
 	if err != nil {
 		return nil, err
 	}
 	return &session, nil
 }
 
-func (r *AuthRepository) GetSessionByRefreshToken(ctx context.Context, refreshToken string) (*models.Session, error) {
-	var session models.Session
-	err := r.db.WithContext(ctx).Where("refresh_token = ? AND expires_at > ?", refreshToken, time.Now()).First(&session).Error
+// GetSessionsByUserAndClient lists all active sessions for a user under a client.
+func (r *AuthRepository) GetSessionsByUserAndClient(ctx context.Context, userID, clientID string) ([]models.Session, error) {
+	var sessions []models.Session
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND client_id = ? AND expires_at > ?", userID, clientID, time.Now()).
+		Order("created_at ASC").
+		Find(&sessions).Error
 	if err != nil {
 		return nil, err
 	}
-	return &session, nil
+	return sessions, nil
 }
 
-func (r *AuthRepository) DeleteSessionByUserAndClient(ctx context.Context, userID, clientID string) error {
-	return r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND client_id = ?", userID, clientID).Error
+func (r *AuthRepository) DeleteSessionByID(ctx context.Context, sessionID string) error {
+	return r.db.WithContext(ctx).Delete(&models.Session{}, "session_id = ?", sessionID).Error
 }
 
-func (r *AuthRepository) DeleteSessionByRefreshToken(ctx context.Context, refreshToken string) error {
-	return r.db.WithContext(ctx).Delete(&models.Session{}, "refresh_token = ?", refreshToken).Error
+// DeleteUserClientSessions removes every session a user holds under a client.
+func (r *AuthRepository) DeleteUserClientSessions(ctx context.Context, userID, clientID string) (int64, error) {
+	result := r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND client_id = ?", userID, clientID)
+	return result.RowsAffected, result.Error
+}
+
+// DeleteOtherUserSessions removes all of a user's sessions except the one to keep.
+func (r *AuthRepository) DeleteOtherUserSessions(ctx context.Context, userID, keepSessionID string) error {
+	return r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND session_id <> ?", userID, keepSessionID).Error
 }
 
 func (r *AuthRepository) DeleteAllUserSessions(ctx context.Context, userID string) error {
@@ -119,9 +126,9 @@ func (r *AuthRepository) DeleteExpiredSessions(ctx context.Context) error {
 }
 
 // Utility functions
-func (r *AuthRepository) IsEmailExists(ctx context.Context, email string) (bool, error) {
+func (r *AuthRepository) IsEmailExists(ctx context.Context, email, clientID string) (bool, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ?", email).Count(&count).Error
+	err := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ? AND client_id = ?", email, clientID).Count(&count).Error
 	if err != nil {
 		return false, err
 	}

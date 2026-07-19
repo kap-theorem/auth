@@ -66,12 +66,54 @@ Create a `.env` file with the following variables:
 # Database Configuration
 DB_CONNECTION_STRING=user:password@tcp(localhost:3306)/authdb?charset=utf8mb4&parseTime=True&loc=Local
 
-# JWT Configuration
-JWT_SECRET=your-super-secure-jwt-secret-key-here-make-it-long-and-random
+# JWT signing (RS256)
+# Path to an RSA private key in PEM format (PKCS#1 or PKCS#8).
+# - If the file does not exist, a 2048-bit dev key is generated and written
+#   to this path (0600) on first use.
+# - If the variable is unset entirely, an ephemeral in-memory dev key is
+#   generated and a warning is logged; tokens will not survive a restart.
+#   Do not run production without a persistent key file.
+JWT_PRIVATE_KEY_FILE=./jwt_private_key.pem
+
+# Admin gate for RegisterClient / ChangeClientSecret.
+# These RPCs fail closed if ADMIN_SECRET is unset.
+ADMIN_SECRET=choose-a-long-random-admin-secret
+
+# TLS on the gRPC listener.
+# Both must be set unless ENV=dev, in which case plaintext is allowed.
+TLS_CERT_FILE=/path/to/server.crt
+TLS_KEY_FILE=/path/to/server.key
+ENV=dev
 
 # Server Configuration
 SERVER_PORT=8080
 ```
+
+## Token Design
+
+- **Access token**: RS256-signed JWT, 30-minute expiry. Claims: `sub`
+  (user_id), `client_id`, `session_id`, `iat`, `exp`, `iss`. No refresh
+  token, username, or email in the payload. `ValidateToken` is
+  revocation-aware: it also checks that the session row still exists.
+- **Refresh token**: opaque `"<session_id>.<secret>"`, where `secret` is
+  256 bits of randomness (hex). The `session_id` prefix is the indexed
+  lookup key (the sessions primary key); only a bcrypt hash of the secret
+  half is stored. Tokens are rotated on every `RefreshToken` call with a
+  sliding 7-day expiry. Presenting a rotated (stale) token is treated as a
+  theft signal and revokes the entire session.
+- **Multi-session**: each login creates a new session row keyed by a
+  `session_id` UUID; users may hold many concurrent sessions per client.
+- **Client credentials**: every RPC (except `HealthCheck`) requires
+  `client_id` + `client_secret`, verified against a bcrypt hash in constant
+  time. Client secrets are shown once at registration/rotation.
+
+## Rate Limits (in-memory token buckets)
+
+- Login (`GetToken`): 5 attempts / email / client / 15 minutes
+- Registration (`RegisterUser`): 10 / client / hour
+- Per-client ceiling: 1000 requests / minute
+
+Buckets are per-process; move to Redis before replicating the service.
 
 ## Database Setup
 
@@ -251,11 +293,15 @@ grpcurl -plaintext -d '{"email": "john@example.com", "password": "password123", 
 
 ## Security Features
 
-- **Password Hashing**: bcrypt with salt
-- **JWT Tokens**: HMAC-SHA256 signed tokens
-- **Session Management**: Secure refresh token rotation
-- **Client Validation**: Multi-tenant support with client isolation
-- **Input Validation**: Email format, password strength, required fields
+- **Password Hashing**: bcrypt with salt (user passwords, client secrets, refresh tokens)
+- **JWT Tokens**: RS256 signed tokens, 30-minute expiry, revocation-aware validation
+- **Session Management**: Multi-session per user with rotated refresh tokens; reuse of a rotated token revokes the session
+- **Client Validation**: Multi-tenant support with client isolation; email uniqueness is scoped per client; client secret required on every RPC
+- **Admin Gate**: `RegisterClient` / `ChangeClientSecret` require `ADMIN_SECRET`
+- **Rate Limiting**: in-memory token buckets on login, registration, and per-client volume
+- **TLS**: required on the listener unless `ENV=dev`
+- **Input Validation**: Email format, password strength (≥8 chars, also on password change), required fields
+- **No PII in logs**: user_ids and client_ids only — never emails or tokens
 - **Automatic Cleanup**: Expired sessions are cleaned up hourly
 
 ## Error Handling
