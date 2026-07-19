@@ -255,14 +255,26 @@ func (s *PlatformServiceServerImpl) requireSuperadmin(ctx context.Context, acces
 
 func appToProto(c *models.Client) *authv1.App {
 	return &authv1.App{
-		ClientId:      c.ClientID,
-		Name:          c.ClientName,
-		OrgId:         c.OrgID,
-		IdentityScope: c.IdentityScope,
-		Suspended:     c.Suspended,
-		CreatedAt:     timestamppb.New(c.CreatedAt),
-		RedirectUris:  c.GetRedirectURIs(),
+		ClientId:        c.ClientID,
+		Name:            c.ClientName,
+		OrgId:           c.OrgID,
+		IdentityScope:   c.IdentityScope,
+		Suspended:       c.Suspended,
+		CreatedAt:       timestamppb.New(c.CreatedAt),
+		RedirectUris:    c.GetRedirectURIs(),
+		DemoEnabled:     c.DemoEnabled,
+		LoginIdentifier: c.LoginIdentifier,
+		PublicSignup:    c.PublicSignup,
 	}
+}
+
+// validLoginIdentifier reports whether m is a recognized login-identifier mode.
+func validLoginIdentifier(m string) bool {
+	switch m {
+	case "username_or_email", "email_only", "username_only":
+		return true
+	}
+	return false
 }
 
 // normalizeRedirectURIs trims, drops empties, dedupes, and validates that
@@ -672,6 +684,28 @@ func (s *PlatformServiceServerImpl) UpdateApp(ctx context.Context, req *authv1.U
 			return fail("Internal server error")
 		}
 	}
+	if req.DemoEnabled != nil {
+		client.DemoEnabled = *req.DemoEnabled
+	}
+	if req.DemoEmail != nil {
+		client.DemoEmail = strings.TrimSpace(*req.DemoEmail)
+	}
+	if req.DemoPassword != nil {
+		client.DemoPassword = *req.DemoPassword
+	}
+	if req.LoginIdentifier != nil {
+		if !validLoginIdentifier(*req.LoginIdentifier) {
+			return fail("login_identifier must be 'username_or_email', 'email_only', or 'username_only'")
+		}
+		client.LoginIdentifier = *req.LoginIdentifier
+	}
+	if req.PublicSignup != nil {
+		client.PublicSignup = *req.PublicSignup
+	}
+	// Guard: enabling demo login requires demo credentials to be present.
+	if client.DemoEnabled && (client.DemoEmail == "" || client.DemoPassword == "") {
+		return fail("demo login requires a demo email and password")
+	}
 
 	if err := s.repo.UpdateClient(ctx, client); err != nil {
 		log.Printf("UpdateApp: update failed for client %s: %v", req.ClientId, err)
@@ -773,10 +807,19 @@ func (s *PlatformServiceServerImpl) GetAppPublicInfo(ctx context.Context, req *a
 	if err != nil {
 		return &authv1.GetAppPublicInfoResponse{Success: false}, nil
 	}
+	hostedEnabled := len(client.GetRedirectURIs()) > 0 && !client.Suspended
+	loginID := client.LoginIdentifier
+	if loginID == "" {
+		loginID = "username_or_email"
+	}
 	return &authv1.GetAppPublicInfoResponse{
 		Success:            true,
 		Name:               client.ClientName,
-		HostedLoginEnabled: len(client.GetRedirectURIs()) > 0 && !client.Suspended,
+		HostedLoginEnabled: hostedEnabled,
+		// Demo/signup buttons only make sense when hosted pages are enabled.
+		DemoEnabled:     hostedEnabled && client.DemoEnabled && client.DemoEmail != "",
+		LoginIdentifier: loginID,
+		PublicSignup:    hostedEnabled && client.PublicSignup,
 	}, nil
 }
 
@@ -815,6 +858,118 @@ func (s *PlatformServiceServerImpl) HostedLogin(ctx context.Context, req *authv1
 		return nil, err
 	}
 	return &authv1.HostedLoginResponse{
+		Success:      resp.Success,
+		Message:      resp.Message,
+		AccessToken:  resp.AccessToken,
+		RefreshToken: resp.RefreshToken,
+		ExpiresAt:    resp.ExpiresAt,
+		User:         resp.User,
+		SessionId:    resp.SessionId,
+	}, nil
+}
+
+// hostedClientForRedirect is the shared trust gate for the secret-free hosted
+// login/demo/register RPCs: hosted pages enabled AND redirect_uri exactly
+// whitelisted. Returns the same generic error for every rejection so unknown
+// app / suspended / unlisted-redirect are indistinguishable.
+func (s *PlatformServiceServerImpl) hostedClientForRedirect(ctx context.Context, clientID, redirectURI string) (*models.Client, error) {
+	client, err := s.hostedEnabledClient(ctx, clientID)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(client.GetRedirectURIs(), redirectURI) {
+		return nil, fmt.Errorf("redirect_uri not whitelisted")
+	}
+	return client, nil
+}
+
+// HostedDemoLogin logs in the app's configured demo account with one click.
+// The demo password is stored server-side and never sent to the browser. The
+// demo user is resolved by email regardless of the app's login-identifier mode.
+func (s *PlatformServiceServerImpl) HostedDemoLogin(ctx context.Context, req *authv1.HostedDemoLoginRequest) (*authv1.HostedDemoLoginResponse, error) {
+	log.Printf("HostedDemoLogin request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.HostedDemoLoginResponse, error) {
+		return &authv1.HostedDemoLoginResponse{Success: false, Message: msg}, nil
+	}
+
+	if req.ClientId == "" || req.RedirectUri == "" {
+		return fail("Client ID and redirect URI are required")
+	}
+	client, err := s.hostedClientForRedirect(ctx, req.ClientId, req.RedirectUri)
+	if err != nil {
+		log.Printf("HostedDemoLogin rejected for client %s: %v", req.ClientId, err)
+		return fail("Demo login is not available for this app")
+	}
+	if !client.DemoEnabled || client.DemoEmail == "" || client.DemoPassword == "" {
+		return fail("Demo login is not available for this app")
+	}
+
+	scopeType, scopeID := userScope(client)
+	user, err := s.repo.GetUserByEmail(ctx, client.DemoEmail, scopeType, scopeID)
+	if err != nil {
+		log.Printf("HostedDemoLogin: demo user lookup failed for client %s: %v", req.ClientId, err)
+		return fail("Demo login is not available for this app")
+	}
+	resp, err := finishLogin(ctx, s.repo, client, user, client.DemoPassword, req.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	return &authv1.HostedDemoLoginResponse{
+		Success:      resp.Success,
+		Message:      resp.Message,
+		AccessToken:  resp.AccessToken,
+		RefreshToken: resp.RefreshToken,
+		ExpiresAt:    resp.ExpiresAt,
+		User:         resp.User,
+		SessionId:    resp.SessionId,
+	}, nil
+}
+
+// HostedRegister is the secret-free public signup path. Enabled per app via
+// public_signup; trust anchored on the redirect whitelist (like HostedLogin).
+// On success the new user is logged in.
+func (s *PlatformServiceServerImpl) HostedRegister(ctx context.Context, req *authv1.HostedRegisterRequest) (*authv1.HostedRegisterResponse, error) {
+	log.Printf("HostedRegister request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.HostedRegisterResponse, error) {
+		return &authv1.HostedRegisterResponse{Success: false, Message: msg}, nil
+	}
+
+	if req.ClientId == "" || req.RedirectUri == "" {
+		return fail("Client ID and redirect URI are required")
+	}
+	if strings.TrimSpace(req.Username) == "" || strings.TrimSpace(req.Email) == "" {
+		return fail("Username and email are required")
+	}
+	if len(req.Password) < 8 {
+		return fail("Password must be at least 8 characters")
+	}
+	client, err := s.hostedClientForRedirect(ctx, req.ClientId, req.RedirectUri)
+	if err != nil {
+		log.Printf("HostedRegister rejected for client %s: %v", req.ClientId, err)
+		return fail("Signup is not available for this app")
+	}
+	if !client.PublicSignup {
+		return fail("Signup is not available for this app")
+	}
+
+	userID, msg, ok := createEndUser(ctx, s.repo, client, strings.TrimSpace(req.Username), strings.TrimSpace(req.Email), req.Password)
+	if !ok {
+		return fail(msg)
+	}
+	log.Printf("HostedRegister: user %s created for client %s; auto-logging in", userID, req.ClientId)
+
+	// Auto-login the freshly created user.
+	user, err := s.repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return fail("Account created; please sign in")
+	}
+	resp, err := finishLogin(ctx, s.repo, client, user, req.Password, req.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	return &authv1.HostedRegisterResponse{
 		Success:      resp.Success,
 		Message:      resp.Message,
 		AccessToken:  resp.AccessToken,
@@ -917,8 +1072,89 @@ func (s *PlatformServiceServerImpl) HostedChangePassword(ctx context.Context, re
 		return &authv1.HostedChangePasswordResponse{Success: false, Message: "Not signed in"}, nil
 	}
 
+	// Respect an admin-set password lock.
+	if user, uerr := s.repo.GetUserByID(ctx, claims.Subject); uerr == nil && user.LockPassword {
+		return &authv1.HostedChangePasswordResponse{Success: false, Message: "Password changes are disabled for this account"}, nil
+	}
+
 	ok, msg := changeUserPassword(ctx, s.repo, claims.Subject, current.SessionID, req.CurrentPassword, req.NewPassword)
 	return &authv1.HostedChangePasswordResponse{Success: ok, Message: msg}, nil
+}
+
+// HostedUpdateProfile lets the token owner change their own username and/or
+// email, honoring admin-set locks and per-scope uniqueness. Unset fields are
+// left unchanged.
+func (s *PlatformServiceServerImpl) HostedUpdateProfile(ctx context.Context, req *authv1.HostedUpdateProfileRequest) (*authv1.HostedUpdateProfileResponse, error) {
+	log.Printf("HostedUpdateProfile request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.HostedUpdateProfileResponse, error) {
+		return &authv1.HostedUpdateProfileResponse{Success: false, Message: msg}, nil
+	}
+
+	claims, _, err := s.authenticateHostedUser(ctx, req.ClientId, req.AccessToken)
+	if err != nil {
+		log.Printf("HostedUpdateProfile rejected for client %s: %v", req.ClientId, err)
+		return fail("Not signed in")
+	}
+	user, err := s.repo.GetUserByID(ctx, claims.Subject)
+	if err != nil {
+		return fail("Not signed in")
+	}
+
+	if req.Username != nil {
+		name := strings.TrimSpace(*req.Username)
+		if name != user.UserName {
+			if user.LockUsername {
+				return fail("Username changes are disabled for this account")
+			}
+			if name == "" {
+				return fail("Username cannot be empty")
+			}
+			taken, cerr := s.repo.IsUsernameExists(ctx, name, user.ScopeType, user.ScopeID, user.UserID)
+			if cerr != nil {
+				return fail("Internal server error")
+			}
+			if taken {
+				return fail("Username already taken")
+			}
+			user.UserName = name
+		}
+	}
+	if req.Email != nil {
+		email := strings.TrimSpace(*req.Email)
+		if email != user.Email {
+			if user.LockEmail {
+				return fail("Email changes are disabled for this account")
+			}
+			if !isValidEmail(email) {
+				return fail("A valid email is required")
+			}
+			taken, cerr := s.repo.IsEmailExistsExcluding(ctx, email, user.ScopeType, user.ScopeID, user.UserID)
+			if cerr != nil {
+				return fail("Internal server error")
+			}
+			if taken {
+				return fail("Email already registered")
+			}
+			user.Email = email
+		}
+	}
+
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("HostedUpdateProfile: save failed for user %s: %v", user.UserID, err)
+		return fail("Internal server error")
+	}
+	return &authv1.HostedUpdateProfileResponse{
+		Success: true,
+		Message: "Profile updated successfully",
+		User: &authv1.UserProfile{
+			UserId:    user.UserID,
+			Username:  user.UserName,
+			Email:     user.Email,
+			ClientId:  req.ClientId,
+			CreatedAt: timestamppb.New(user.CreatedAt),
+		},
+	}, nil
 }
 
 // HostedRevokeSession revokes one of the token owner's OWN sessions under

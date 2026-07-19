@@ -118,7 +118,12 @@ func (r *RateLimiter) Check(fullMethod string, req interface{}) error {
 		if !r.login.Allow(clientID + "|" + email) {
 			return status.Error(codes.ResourceExhausted, "too many login attempts, try again later")
 		}
-	case strings.HasSuffix(fullMethod, "/RegisterUser"):
+	// RegisterUser (client-secret) and HostedRegister (public signup) share the
+	// per-client registration bucket.
+	// ponytail: per-client key only; anonymous HostedRegister callers share one
+	// app's bucket. Add a per-IP key once the HTTP gateway forwards the client
+	// IP (X-Forwarded-For) into the RPC context.
+	case strings.HasSuffix(fullMethod, "/RegisterUser"), strings.HasSuffix(fullMethod, "/HostedRegister"):
 		if !r.register.Allow(clientID) {
 			return status.Error(codes.ResourceExhausted, "too many registrations, try again later")
 		}

@@ -6,8 +6,8 @@ import (
 
 	"authservice/pkg/models"
 	"authservice/pkg/repository"
-	authv1 "authservice/proto/auth/v1"
 	"authservice/pkg/utils"
+	authv1 "authservice/proto/auth/v1"
 
 	"gorm.io/gorm"
 )

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -123,6 +124,14 @@ func (dbCon *DBConnection) createTablesIfNotExist() error {
 		return err
 	}
 
+	// Rename pre-existing duplicate usernames BEFORE AutoMigrate creates the
+	// new UNIQUE(user_name, scope_type, scope_id) index, otherwise the index
+	// creation would fail on the duplicate rows.
+	if err := dbCon.migrateUsernameUniqueness(); err != nil {
+		log.Printf("Error reconciling duplicate usernames: %v", err)
+		return err
+	}
+
 	// Migrate in dependency order (orgs -> clients/developers -> users ->
 	// sessions -> tuples/models).
 	for _, model := range models.GetAllModels() {
@@ -183,6 +192,52 @@ func (dbCon *DBConnection) migrateUserScoping() error {
 	}
 
 	log.Println("User scoping migration completed")
+	return nil
+}
+
+// migrateUsernameUniqueness renames pre-existing duplicate usernames within
+// each identity scope so the UNIQUE(user_name, scope_type, scope_id) index can
+// be created. The oldest row (by created_at, then user_id) keeps the name; the
+// rest are suffixed "-2", "-3", … to the first free name in scope. Idempotent:
+// only runs when the unique index does not yet exist.
+func (dbCon *DBConnection) migrateUsernameUniqueness() error {
+	migrator := dbCon.Migrator()
+	if !migrator.HasTable("users") || migrator.HasIndex(&models.User{}, "idx_users_username_scope") {
+		return nil // fresh install (AutoMigrate creates it) or already reconciled
+	}
+
+	var users []models.User
+	if err := dbCon.Order("created_at asc, user_id asc").Find(&users).Error; err != nil {
+		return err
+	}
+
+	type scopeKey struct{ t, id string }
+	taken := map[scopeKey]map[string]bool{}
+	renamed := 0
+	for i := range users {
+		u := &users[i]
+		k := scopeKey{u.ScopeType, u.ScopeID}
+		if taken[k] == nil {
+			taken[k] = map[string]bool{}
+		}
+		if !taken[k][u.UserName] {
+			taken[k][u.UserName] = true
+			continue
+		}
+		newName := u.UserName
+		for n := 2; taken[k][newName]; n++ {
+			newName = fmt.Sprintf("%s-%d", u.UserName, n)
+		}
+		log.Printf("  renaming duplicate username %q -> %q (scope %s:%s, user %s)", u.UserName, newName, u.ScopeType, u.ScopeID, u.UserID)
+		if err := dbCon.Model(&models.User{}).Where("user_id = ?", u.UserID).Update("user_name", newName).Error; err != nil {
+			return err
+		}
+		taken[k][newName] = true
+		renamed++
+	}
+	if renamed > 0 {
+		log.Printf("Username reconciliation completed (%d renamed)", renamed)
+	}
 	return nil
 }
 

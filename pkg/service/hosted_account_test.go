@@ -64,7 +64,7 @@ func TestHostedGetProfile(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("expected profile success, got msg=%s", resp.Message)
 	}
-	if resp.User == nil || resp.User.Email != "user@example.com" || resp.User.Username != "enduser" {
+	if resp.User == nil || resp.User.Email != "user@example.com" || resp.User.Username != "user" {
 		t.Fatalf("unexpected profile: %+v", resp.User)
 	}
 	if len(resp.Sessions) != 2 {

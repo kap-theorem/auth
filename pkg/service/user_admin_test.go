@@ -15,7 +15,7 @@ func containsFold(s, substr string) bool {
 }
 
 // registerNamedUser creates an end user with a specific username (the shared
-// registerEndUser helper hardcodes "enduser").
+// registerEndUser helper derives the username from the email local part).
 func registerNamedUser(t *testing.T, auth *AuthServiceServerImpl, clientID, clientSecret, username, email, password string) string {
 	t.Helper()
 	resp, err := auth.RegisterUser(context.Background(), &authv1.RegisterUserRequest{

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"authservice/pkg/repository"
@@ -26,8 +27,14 @@ func setRedirectURIs(t *testing.T, plat *PlatformServiceServerImpl, token, clien
 // registerEndUser creates an end user on an app via AuthService.RegisterUser.
 func registerEndUser(t *testing.T, auth *AuthServiceServerImpl, clientID, clientSecret, email, password string) {
 	t.Helper()
+	// Username must be unique per scope; derive it from the email local part
+	// so distinct callers don't collide.
+	username := "enduser"
+	if i := strings.IndexByte(email, '@'); i > 0 {
+		username = email[:i]
+	}
 	resp, err := auth.RegisterUser(context.Background(), &authv1.RegisterUserRequest{
-		Username:     "enduser",
+		Username:     username,
 		Email:        email,
 		Password:     password,
 		ClientId:     clientID,

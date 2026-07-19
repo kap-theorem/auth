@@ -217,58 +217,63 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 		}, nil
 	}
 
-	// Check if email already exists within the client's identity scope
-	scopeType, scopeID := userScope(client)
-	emailExists, err := s.repo.IsEmailExists(ctx, req.Email, scopeType, scopeID)
-	if err != nil {
-		log.Printf("Error checking email existence: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
+	userID, msg, ok := createEndUser(ctx, s.repo, client, req.Username, req.Email, req.Password)
+	if !ok {
+		return &authv1.RegisterUserResponse{Success: false, Message: msg}, nil
 	}
-	if emailExists {
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Email already registered",
-		}, nil
-	}
-
-	// Hash password
-	hashedPassword, err := utils.HashPassword(req.Password)
-	if err != nil {
-		log.Printf("Error hashing password: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Create user
-	userID := utils.GenerateUUID()
-	user := &models.User{
-		UserID:    userID,
-		UserName:  req.Username,
-		Email:     req.Email,
-		Password:  hashedPassword,
-		ScopeType: scopeType,
-		ScopeID:   scopeID,
-	}
-
-	if err := s.repo.CreateUser(ctx, user); err != nil {
-		log.Printf("Error creating user: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Failed to create user",
-		}, nil
-	}
-
 	log.Printf("User registered successfully: %s (client: %s)", userID, req.ClientId)
 	return &authv1.RegisterUserResponse{
 		Success: true,
 		Message: "User registered successfully",
 		UserId:  userID,
 	}, nil
+}
+
+// createEndUser creates an end user within the client's identity scope,
+// enforcing per-scope email AND username uniqueness. Shared by RegisterUser
+// (client-secret) and HostedRegister (public signup). Returns (userID,
+// message, ok); on ok==false the message is a user-safe reason.
+func createEndUser(ctx context.Context, repo *repository.AuthRepository, client *models.Client, username, email, password string) (string, string, bool) {
+	scopeType, scopeID := userScope(client)
+
+	emailExists, err := repo.IsEmailExists(ctx, email, scopeType, scopeID)
+	if err != nil {
+		log.Printf("Error checking email existence: %v", err)
+		return "", "Internal server error", false
+	}
+	if emailExists {
+		return "", "Email already registered", false
+	}
+
+	usernameExists, err := repo.IsUsernameExists(ctx, username, scopeType, scopeID, "")
+	if err != nil {
+		log.Printf("Error checking username existence: %v", err)
+		return "", "Internal server error", false
+	}
+	if usernameExists {
+		return "", "Username already taken", false
+	}
+
+	hashedPassword, err := utils.HashPassword(password)
+	if err != nil {
+		log.Printf("Error hashing password: %v", err)
+		return "", "Internal server error", false
+	}
+
+	userID := utils.GenerateUUID()
+	user := &models.User{
+		UserID:    userID,
+		UserName:  username,
+		Email:     email,
+		Password:  hashedPassword,
+		ScopeType: scopeType,
+		ScopeID:   scopeID,
+	}
+	if err := repo.CreateUser(ctx, user); err != nil {
+		log.Printf("Error creating user: %v", err)
+		return "", "Failed to create user", false
+	}
+	return userID, "", true
 }
 
 func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTokenRequest) (*authv1.GetTokenResponse, error) {
@@ -301,11 +306,30 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 // one row per login/device), and returns the token pair + profile. The
 // caller must already have established trust in the client (client secret
 // for GetToken; the redirect_uri whitelist for HostedLogin).
-func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, client *models.Client, email, password, userAgent string) (*authv1.GetTokenResponse, error) {
-	// Resolve the user within the client's identity scope (app-scoped
-	// clients have their own users; org-scoped clients share the org pool)
+// resolveLoginUser looks up the login user by the app's login-identifier mode.
+// 'email_only'    -> identifier is an email.
+// 'username_only' -> identifier is a username.
+// 'username_or_email' (default) -> an "@" picks email, otherwise username.
+func resolveLoginUser(ctx context.Context, repo *repository.AuthRepository, client *models.Client, identifier string) (*models.User, error) {
 	scopeType, scopeID := userScope(client)
-	user, err := repo.GetUserByEmail(ctx, email, scopeType, scopeID)
+	switch client.LoginIdentifier {
+	case "email_only":
+		return repo.GetUserByEmail(ctx, identifier, scopeType, scopeID)
+	case "username_only":
+		return repo.GetUserByUsername(ctx, identifier, scopeType, scopeID)
+	default: // username_or_email
+		if strings.Contains(identifier, "@") {
+			return repo.GetUserByEmail(ctx, identifier, scopeType, scopeID)
+		}
+		return repo.GetUserByUsername(ctx, identifier, scopeType, scopeID)
+	}
+}
+
+func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, client *models.Client, identifier, password, userAgent string) (*authv1.GetTokenResponse, error) {
+	// Resolve the user within the client's identity scope (app-scoped
+	// clients have their own users; org-scoped clients share the org pool),
+	// honoring the app's login-identifier mode (username / email / either).
+	user, err := resolveLoginUser(ctx, repo, client, identifier)
 	if err != nil {
 		log.Printf("Login failed for client %s: user lookup error", client.ClientID)
 		return &authv1.GetTokenResponse{
@@ -313,7 +337,14 @@ func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, clie
 			Message: "Invalid credentials",
 		}, nil
 	}
+	return finishLogin(ctx, repo, client, user, password, userAgent)
+}
 
+// finishLogin verifies the password, rejects deactivated users, creates a
+// session, and returns the token pair + profile. Shared by the identifier
+// login path (issueLoginTokens) and demo login (which resolves the user by
+// email directly, bypassing the login-identifier mode).
+func finishLogin(ctx context.Context, repo *repository.AuthRepository, client *models.Client, user *models.User, password, userAgent string) (*authv1.GetTokenResponse, error) {
 	// Verify password
 	if !utils.CheckPasswordHash(password, user.Password) {
 		log.Printf("Login failed for user %s (client: %s)", user.UserID, client.ClientID)

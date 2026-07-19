@@ -34,6 +34,17 @@ func (r *AuthRepository) GetUserByEmail(ctx context.Context, email, scopeType, s
 	return &user, nil
 }
 
+// GetUserByUsername resolves a user by username within an identity scope
+// (username uniqueness is per scope: app or org).
+func (r *AuthRepository) GetUserByUsername(ctx context.Context, username, scopeType, scopeID string) (*models.User, error) {
+	var user models.User
+	err := r.db.WithContext(ctx).Where("user_name = ? AND scope_type = ? AND scope_id = ?", username, scopeType, scopeID).First(&user).Error
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
 func (r *AuthRepository) GetUserByID(ctx context.Context, userID string) (*models.User, error) {
 	var user models.User
 	err := r.db.WithContext(ctx).Where("user_id = ?", userID).First(&user).Error
@@ -189,6 +200,37 @@ func (r *AuthRepository) DeleteExpiredSessions(ctx context.Context) error {
 func (r *AuthRepository) IsEmailExists(ctx context.Context, email, scopeType, scopeID string) (bool, error) {
 	var count int64
 	err := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ? AND scope_type = ? AND scope_id = ?", email, scopeType, scopeID).Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// IsUsernameExists reports whether a username is taken within an identity
+// scope (username uniqueness is per scope). excludeUserID, when non-empty, is
+// ignored in the count — used by profile/admin edits to allow a no-op rename.
+func (r *AuthRepository) IsUsernameExists(ctx context.Context, username, scopeType, scopeID, excludeUserID string) (bool, error) {
+	var count int64
+	q := r.db.WithContext(ctx).Model(&models.User{}).Where("user_name = ? AND scope_type = ? AND scope_id = ?", username, scopeType, scopeID)
+	if excludeUserID != "" {
+		q = q.Where("user_id <> ?", excludeUserID)
+	}
+	err := q.Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// IsEmailExistsExcluding is IsEmailExists with an excluded user id, used by
+// profile/admin edits so an unchanged email is not treated as a conflict.
+func (r *AuthRepository) IsEmailExistsExcluding(ctx context.Context, email, scopeType, scopeID, excludeUserID string) (bool, error) {
+	var count int64
+	q := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ? AND scope_type = ? AND scope_id = ?", email, scopeType, scopeID)
+	if excludeUserID != "" {
+		q = q.Where("user_id <> ?", excludeUserID)
+	}
+	err := q.Count(&count).Error
 	if err != nil {
 		return false, err
 	}

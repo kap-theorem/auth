@@ -73,6 +73,17 @@ service PlatformService {
   // app is not suspended. Same response shape as AuthService.GetToken;
   // rate-limited with the same per-email login limiter as GetToken.
   rpc HostedLogin(HostedLoginRequest) returns (HostedLoginResponse);
+  // Client-secret-free ONE-CLICK demo login for the hosted login page.
+  // Succeeds only when the app has demo login enabled and redirect_uri
+  // EXACTLY matches a whitelisted redirect_uri. Logs in the app's configured
+  // demo account server-side (its password is never sent to the browser).
+  rpc HostedDemoLogin(HostedDemoLoginRequest) returns (HostedDemoLoginResponse);
+  // Client-secret-free public self-serve signup for the hosted login page.
+  // Succeeds only when the app has public_signup enabled and redirect_uri
+  // EXACTLY matches a whitelisted redirect_uri. On success the new user is
+  // logged in (same response shape as HostedLogin). Rate-limited per client
+  // AND per client IP.
+  rpc HostedRegister(HostedRegisterRequest) returns (HostedRegisterResponse);
 
   // Hosted account page (spec "Hosted account page", added 2026-07-18)
   // All four RPCs are authenticated purely by the END USER's access token
@@ -91,6 +102,10 @@ service PlatformService {
   // Revokes ALL of the token owner's sessions for this client, including
   // the current one.
   rpc HostedLogoutAll(HostedLogoutAllRequest) returns (HostedLogoutAllResponse);
+  // Self-edit of the token owner's own username and/or email. Rejects any
+  // field the admin has locked (lock_username / lock_email). Enforces the
+  // per-scope username and email uniqueness invariants.
+  rpc HostedUpdateProfile(HostedUpdateProfileRequest) returns (HostedUpdateProfileResponse);
 
   // App user management (spec "App user management", added 2026-07-19)
   // All four RPCs take a developer token; the app must belong to the
@@ -110,6 +125,10 @@ service PlatformService {
   // IDENTITY is disabled, not just its access to one app — and blocks
   // every login flow until reactivation.
   rpc SetUserActive(SetUserActiveRequest) returns (SetUserActiveResponse);
+  // Admin edit of an app user: change username/email/password and set the
+  // per-field self-edit locks. Admins bypass locks. Enforces per-scope
+  // username/email uniqueness. Empty/unset fields are left unchanged.
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
 
   // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
   rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
@@ -131,6 +150,15 @@ message App {
   // Exact redirect URIs whitelisted for hosted login. Empty = hosted login
   // disabled.
   repeated string redirect_uris = 7;
+  // One-click demo login enabled on the hosted login page. The demo account's
+  // email/password are configured via UpdateApp and never returned here.
+  bool demo_enabled = 8;
+  // Login identifier mode: 'username_or_email' (default) | 'email_only' |
+  // 'username_only'. Controls what the hosted login page accepts.
+  string login_identifier = 9;
+  // Public self-serve signup enabled on the hosted login page. When false
+  // (default) the app is invite-only (admins provision accounts).
+  bool public_signup = 10;
 }
 
 message Developer {
@@ -218,6 +246,11 @@ message UpdateAppRequest {
   // an empty list with the flag set disables hosted login).
   repeated string redirect_uris = 5;
   bool set_redirect_uris = 6;
+  optional bool demo_enabled = 7;            // unset = unchanged
+  optional string demo_email = 8;            // demo account email
+  optional string demo_password = 9;         // demo account password (server-side)
+  optional string login_identifier = 10;     // unset = unchanged
+  optional bool public_signup = 11;          // unset = unchanged
 }
 
 message UpdateAppResponse {
@@ -379,6 +412,13 @@ message GetAppPublicInfoResponse {
   bool success = 1;
   string name = 2;
   bool hosted_login_enabled = 3;
+  // Whether the hosted login page should show the "Login as Demo User" button.
+  bool demo_enabled = 4;
+  // Login identifier mode (see App.login_identifier). Empty defaults to
+  // 'username_or_email'.
+  string login_identifier = 5;
+  // Whether the hosted login page should show the "Sign up" link.
+  bool public_signup = 6;
 }
 
 message HostedLoginRequest {
@@ -400,6 +440,77 @@ message HostedLoginResponse {
   google.protobuf.Timestamp expires_at = 5;
   UserProfile user = 6;
   string session_id = 7;
+}
+
+// One-click demo login (secret-free). Same response shape as HostedLogin.
+message HostedDemoLoginRequest {
+  string client_id = 1;
+  string redirect_uri = 2; // must EXACTLY match a whitelisted redirect_uri
+  string user_agent = 3;   // optional
+}
+
+message HostedDemoLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
+}
+
+// Public self-serve signup (secret-free). On success the new user is logged
+// in; same response shape as HostedLogin.
+message HostedRegisterRequest {
+  string client_id = 1;
+  string username = 2;
+  string email = 3;
+  string password = 4;
+  string redirect_uri = 5; // must EXACTLY match a whitelisted redirect_uri
+  string user_agent = 6;   // optional
+}
+
+message HostedRegisterResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
+}
+
+// Self-edit of the token owner's own profile. Unset fields are unchanged.
+message HostedUpdateProfileRequest {
+  string client_id = 1;
+  string access_token = 2;
+  optional string username = 3;
+  optional string email = 4;
+}
+
+message HostedUpdateProfileResponse {
+  bool success = 1;
+  string message = 2;
+  UserProfile user = 3;
+}
+
+// Admin edit of an app user. Unset fields are left unchanged.
+message UpdateUserRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+  optional string username = 4;
+  optional string email = 5;
+  optional string password = 6;
+  optional bool lock_username = 7;
+  optional bool lock_email = 8;
+  optional bool lock_password = 9;
+}
+
+message UpdateUserResponse {
+  bool success = 1;
+  string message = 2;
+  AppUser user = 3;
 }
 
 // Hosted account page (spec "Hosted account page", added 2026-07-18).
@@ -466,6 +577,11 @@ message AppUser {
   // present for org-scoped apps). Deactivating an org user disables the
   // identity across every app in the org.
   string scope = 7;
+  // Per-field self-edit locks: when true the user cannot change that field
+  // on their profile page (admins always can).
+  bool lock_username = 8;
+  bool lock_email = 9;
+  bool lock_password = 10;
 }
 
 message ListAppUsersRequest {

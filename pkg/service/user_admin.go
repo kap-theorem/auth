@@ -2,10 +2,12 @@ package service
 
 import (
 	"authservice/pkg/models"
+	"authservice/pkg/utils"
 	authv1 "authservice/proto/auth/v1"
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -57,6 +59,9 @@ func appUserToProto(u *models.User, scope string, sessionCount int64) *authv1.Ap
 		Active:       u.Active,
 		SessionCount: int32(sessionCount),
 		Scope:        scope,
+		LockUsername: u.LockUsername,
+		LockEmail:    u.LockEmail,
+		LockPassword: u.LockPassword,
 	}
 }
 
@@ -213,6 +218,96 @@ func (s *PlatformServiceServerImpl) SetUserActive(ctx context.Context, req *auth
 	return &authv1.SetUserActiveResponse{
 		Success: true,
 		Message: msg,
+		User:    appUserToProto(user, user.ScopeType, counts[user.UserID]),
+	}, nil
+}
+
+// UpdateUser is the admin edit for an app user: change username/email/password
+// and set the per-field self-edit locks. Admins bypass locks. Enforces
+// per-scope username/email uniqueness. Unset fields are left unchanged.
+func (s *PlatformServiceServerImpl) UpdateUser(ctx context.Context, req *authv1.UpdateUserRequest) (*authv1.UpdateUserResponse, error) {
+	log.Printf("UpdateUser request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.UpdateUserResponse, error) {
+		return &authv1.UpdateUserResponse{Success: false, Message: msg}, nil
+	}
+
+	client, err := s.authorizeAppUserAdmin(ctx, req.AccessToken, req.ClientId)
+	if err != nil {
+		log.Printf("UpdateUser rejected for client %s: %v", req.ClientId, err)
+		return fail("App not found")
+	}
+	user, err := s.requireAppScopedUser(ctx, client, req.UserId)
+	if err != nil {
+		log.Printf("UpdateUser: target check failed (client: %s): %v", client.ClientID, err)
+		return fail("User not found")
+	}
+
+	if req.Username != nil {
+		name := strings.TrimSpace(*req.Username)
+		if name == "" {
+			return fail("Username cannot be empty")
+		}
+		if name != user.UserName {
+			taken, cerr := s.repo.IsUsernameExists(ctx, name, user.ScopeType, user.ScopeID, user.UserID)
+			if cerr != nil {
+				return fail("Internal server error")
+			}
+			if taken {
+				return fail("Username already taken")
+			}
+			user.UserName = name
+		}
+	}
+	if req.Email != nil {
+		email := strings.TrimSpace(*req.Email)
+		if !isValidEmail(email) {
+			return fail("A valid email is required")
+		}
+		if email != user.Email {
+			taken, cerr := s.repo.IsEmailExistsExcluding(ctx, email, user.ScopeType, user.ScopeID, user.UserID)
+			if cerr != nil {
+				return fail("Internal server error")
+			}
+			if taken {
+				return fail("Email already registered")
+			}
+			user.Email = email
+		}
+	}
+	if req.Password != nil && *req.Password != "" {
+		if len(*req.Password) < 8 {
+			return fail("Password must be at least 8 characters")
+		}
+		hashed, herr := utils.HashPassword(*req.Password)
+		if herr != nil {
+			return fail("Internal server error")
+		}
+		user.Password = hashed
+	}
+	if req.LockUsername != nil {
+		user.LockUsername = *req.LockUsername
+	}
+	if req.LockEmail != nil {
+		user.LockEmail = *req.LockEmail
+	}
+	if req.LockPassword != nil {
+		user.LockPassword = *req.LockPassword
+	}
+
+	if err := s.repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("UpdateUser: save failed for user %s: %v", user.UserID, err)
+		return fail("Internal server error")
+	}
+
+	counts, err := s.repo.CountSessionsByUserForClient(ctx, client.ClientID)
+	if err != nil {
+		counts = nil
+	}
+	log.Printf("UpdateUser: user %s updated (client: %s)", user.UserID, client.ClientID)
+	return &authv1.UpdateUserResponse{
+		Success: true,
+		Message: "User updated successfully",
 		User:    appUserToProto(user, user.ScopeType, counts[user.UserID]),
 	}, nil
 }

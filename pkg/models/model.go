@@ -59,7 +59,19 @@ type Client struct {
 	// JSON-encoded list of exact redirect URIs whitelisted for hosted login
 	// (spec "Hosted login"). Empty = hosted login disabled. Use
 	// GetRedirectURIs/SetRedirectURIs.
-	RedirectURIs string         `gorm:"column:redirect_uris;type:text" json:"-"`
+	RedirectURIs string `gorm:"column:redirect_uris;type:text" json:"-"`
+	// One-click demo login on the hosted login page. DemoPassword is stored in
+	// plaintext by design: the account is a throwaway demo credential the
+	// operator sets, used server-side by HostedDemoLogin.
+	// ponytail: plaintext demo password, acceptable for a demo-only account.
+	DemoEnabled  bool   `gorm:"column:demo_enabled;not null;default:false" json:"demo_enabled"`
+	DemoEmail    string `gorm:"column:demo_email;size:255" json:"-"`
+	DemoPassword string `gorm:"column:demo_password;size:255" json:"-"`
+	// Login identifier mode: 'username_or_email' (default) | 'email_only' |
+	// 'username_only'.
+	LoginIdentifier string `gorm:"column:login_identifier;size:20;not null;default:username_or_email" json:"login_identifier"`
+	// Public self-serve signup on the hosted login page (false = invite-only).
+	PublicSignup bool           `gorm:"column:public_signup;not null;default:false" json:"public_signup"`
 	CreatedAt    time.Time      `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt    time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
@@ -94,16 +106,24 @@ func (c *Client) SetRedirectURIs(uris []string) error {
 }
 
 type User struct {
-	UserID   string `gorm:"column:user_id;primaryKey;size:36" json:"user_id"`
-	UserName string `gorm:"column:user_name;size:100;not null" json:"username"`
+	UserID string `gorm:"column:user_id;primaryKey;size:36" json:"user_id"`
+	// Username uniqueness is scoped: UNIQUE(user_name, scope_type, scope_id).
+	// A one-time migration (migrateUsernameUniqueness) renames pre-existing
+	// duplicates before this index is created.
+	UserName string `gorm:"column:user_name;size:100;not null;uniqueIndex:idx_users_username_scope" json:"username"`
 	// Email uniqueness is scoped: UNIQUE(email_id, scope_type, scope_id).
 	Email    string `gorm:"column:email_id;size:255;not null;uniqueIndex:idx_users_email_scope" json:"email"`
 	Password string `gorm:"size:255;not null" json:"-"`
+	// Per-field self-edit locks: when true the user cannot change that field on
+	// their profile page (admins always can). Default false = editable.
+	LockUsername bool `gorm:"column:lock_username;not null;default:false" json:"lock_username"`
+	LockEmail    bool `gorm:"column:lock_email;not null;default:false" json:"lock_email"`
+	LockPassword bool `gorm:"column:lock_password;not null;default:false" json:"lock_password"`
 	// ScopeType/ScopeID replace the former client_id column:
 	//   scope_type='app', scope_id=<client_id>  — app-scoped user base
 	//   scope_type='org', scope_id=<org_id>     — org-shared user pool (SSO)
-	ScopeType string `gorm:"column:scope_type;size:8;not null;uniqueIndex:idx_users_email_scope" json:"scope_type"`
-	ScopeID   string `gorm:"column:scope_id;size:36;not null;index;uniqueIndex:idx_users_email_scope" json:"scope_id"`
+	ScopeType string `gorm:"column:scope_type;size:8;not null;uniqueIndex:idx_users_email_scope;uniqueIndex:idx_users_username_scope" json:"scope_type"`
+	ScopeID   string `gorm:"column:scope_id;size:36;not null;index;uniqueIndex:idx_users_email_scope;uniqueIndex:idx_users_username_scope" json:"scope_id"`
 	// Deactivated users cannot log in through ANY flow and their tokens stop
 	// validating; soft delete (DeletedAt) stays reserved for real deletion.
 	// The column default keeps rows that predate the column active.
