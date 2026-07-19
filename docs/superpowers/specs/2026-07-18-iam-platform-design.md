@@ -194,6 +194,23 @@ redirect), so they never handle passwords:
   authentication (machine-to-machine, no developer token) scoped to that
   client — needed by app backends like wordskali.
 
+### Hosted account page (added 2026-07-18, follows hosted login)
+Console serves a public page `/client/{client_id}/user/profile` where a
+logged-in end user manages their own account. Authenticated purely by the
+user's access token (no client secret in the browser):
+- `HostedGetProfile{client_id, access_token}` → user profile + sessions list
+- `HostedChangePassword{client_id, access_token, current_password,
+  new_password}` — same policy as ChangeUserPassword (≥8 chars, other
+  sessions invalidated)
+- `HostedRevokeSession{client_id, access_token, session_id}` — own sessions
+  only; `HostedLogoutAll{client_id, access_token}`
+- Every Hosted* RPC verifies the token's client_id matches the requested
+  client_id and that hosted login is enabled for the app (whitelist
+  non-empty) — hosted pages exist only for apps that opted in.
+- The page obtains the token from the app via `postMessage` handshake (the
+  embedding app sends {type:"AUTH_TOKEN", access_token} after the iframe
+  posts {type:"PROFILE_READY"}) or `#access_token=` fragment.
+
 ## 8. Console (frontend) — auth.kaplabs.dev
 
 Browser SPA served by the same deployment; talks JSON to the service via
