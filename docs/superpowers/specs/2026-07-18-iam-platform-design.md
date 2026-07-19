@@ -211,6 +211,26 @@ user's access token (no client secret in the browser):
   embedding app sends {type:"AUTH_TOKEN", access_token} after the iframe
   posts {type:"PROFILE_READY"}) or `#access_token=` fragment.
 
+### App user management (added 2026-07-19)
+Developers manage their app's end users from the console (Users tab on app
+detail); superadmins get the same on any app. Developer-token RPCs, own-org
+apps only:
+- `ListAppUsers{access_token, client_id, query?}` → users[] (user_id,
+  username, email, created_at, active, session_count) — query filters
+  username/email substring
+- `ListUserSessionsAdmin{access_token, client_id, user_id}` → sessions[]
+- `RevokeUserSessionsAdmin{access_token, client_id, user_id}` — kill all of
+  a user's sessions for this app
+- `SetUserActive{access_token, client_id, user_id, active}` — deactivated
+  users cannot log in (any flow) and all their sessions are revoked on
+  deactivation; reactivation restores login. Adds `active` flag to User
+  (soft-delete stays reserved for real deletion).
+- Console Users tab: searchable table, per-user actions (revoke sessions,
+  deactivate/reactivate, grant/revoke the app-admin role — the latter is a
+  convenience writer for the `app:<client_id> admin user:<id>` tuple).
+- Org-scoped users are shared across the org's apps; SetUserActive on them
+  affects the whole identity, and the console labels this clearly.
+
 ## 8. Console (frontend) — auth.kaplabs.dev
 
 Browser SPA served by the same deployment; talks JSON to the service via
