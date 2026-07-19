@@ -33,19 +33,32 @@ func NewAuthServiceServer(db *gorm.DB) *AuthServiceServerImpl {
 // authenticateClient verifies client_id + client_secret against the stored
 // bcrypt hash. bcrypt comparison is constant-time. Every RPC (except
 // HealthCheck and the ADMIN_SECRET-gated client management RPCs) must call
-// this first.
-func (s *AuthServiceServerImpl) authenticateClient(ctx context.Context, clientID, clientSecret string) error {
+// this first. Suspended clients fail all RPC authentication.
+func (s *AuthServiceServerImpl) authenticateClient(ctx context.Context, clientID, clientSecret string) (*models.Client, error) {
 	if clientID == "" || clientSecret == "" {
-		return fmt.Errorf("missing client credentials")
+		return nil, fmt.Errorf("missing client credentials")
 	}
 	client, err := s.repo.GetClientByID(ctx, clientID)
 	if err != nil {
-		return fmt.Errorf("client lookup failed: %w", err)
+		return nil, fmt.Errorf("client lookup failed: %w", err)
 	}
 	if !utils.CheckPasswordHash(clientSecret, client.ClientSecretHash) {
-		return fmt.Errorf("client secret mismatch")
+		return nil, fmt.Errorf("client secret mismatch")
 	}
-	return nil
+	if client.Suspended {
+		return nil, fmt.Errorf("client is suspended")
+	}
+	return client, nil
+}
+
+// userScope resolves the identity scope a client's users live in:
+// app-scoped clients own their user base; org-scoped clients share their
+// org's user pool (SSO).
+func userScope(client *models.Client) (scopeType, scopeID string) {
+	if client.IdentityScope == models.ScopeOrg {
+		return models.ScopeOrg, client.OrgID
+	}
+	return models.ScopeApp, client.ClientID
 }
 
 // authenticateUserToken validates an access token for a client and returns
@@ -92,7 +105,8 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	client, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret)
+	if err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.RegisterUserResponse{
 			Success: false,
@@ -100,8 +114,9 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 		}, nil
 	}
 
-	// Check if email already exists within this client
-	emailExists, err := s.repo.IsEmailExists(ctx, req.Email, req.ClientId)
+	// Check if email already exists within the client's identity scope
+	scopeType, scopeID := userScope(client)
+	emailExists, err := s.repo.IsEmailExists(ctx, req.Email, scopeType, scopeID)
 	if err != nil {
 		log.Printf("Error checking email existence: %v", err)
 		return &authv1.RegisterUserResponse{
@@ -129,11 +144,12 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 	// Create user
 	userID := utils.GenerateUUID()
 	user := &models.User{
-		UserID:   userID,
-		UserName: req.Username,
-		Email:    req.Email,
-		Password: hashedPassword,
-		ClientID: req.ClientId,
+		UserID:    userID,
+		UserName:  req.Username,
+		Email:     req.Email,
+		Password:  hashedPassword,
+		ScopeType: scopeType,
+		ScopeID:   scopeID,
 	}
 
 	if err := s.repo.CreateUser(ctx, user); err != nil {
@@ -164,7 +180,8 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	client, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret)
+	if err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.GetTokenResponse{
 			Success: false,
@@ -172,8 +189,10 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
-	// Get user by email within the client scope
-	user, err := s.repo.GetUserByEmail(ctx, req.Email, req.ClientId)
+	// Resolve the user within the client's identity scope (app-scoped
+	// clients have their own users; org-scoped clients share the org pool)
+	scopeType, scopeID := userScope(client)
+	user, err := s.repo.GetUserByEmail(ctx, req.Email, scopeType, scopeID)
 	if err != nil {
 		log.Printf("Login failed for client %s: user lookup error", req.ClientId)
 		return &authv1.GetTokenResponse{
@@ -205,7 +224,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	session := &models.Session{
 		SessionID:        sessionID,
 		UserID:           user.UserID,
-		ClientID:         user.ClientID,
+		ClientID:         req.ClientId,
 		RefreshTokenHash: refreshHash,
 		UserAgent:        req.UserAgent,
 		ExpiresAt:        time.Now().Add(refreshTokenLifetime),
@@ -220,7 +239,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 	}
 
 	// Generate JWT access token (sub, client_id, session_id)
-	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, user.ClientID, sessionID)
+	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, req.ClientId, sessionID)
 	if err != nil {
 		log.Printf("Error generating JWT token: %v", err)
 		return &authv1.GetTokenResponse{
@@ -233,7 +252,7 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		UserId:    user.UserID,
 		Username:  user.UserName,
 		Email:     user.Email,
-		ClientId:  user.ClientID,
+		ClientId:  req.ClientId,
 		CreatedAt: timestamppb.New(user.CreatedAt),
 	}
 
@@ -260,7 +279,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.ValidateTokenResponse{
 			Valid:   false,
@@ -292,7 +311,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		UserId:    user.UserID,
 		Username:  user.UserName,
 		Email:     user.Email,
-		ClientId:  user.ClientID,
+		ClientId:  claims.ClientID,
 		CreatedAt: timestamppb.New(user.CreatedAt),
 	}
 
@@ -317,7 +336,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.RefreshTokenResponse{
 			Success: false,
@@ -416,7 +435,7 @@ func (s *AuthServiceServerImpl) RevokeToken(ctx context.Context, req *authv1.Rev
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.RevokeTokenResponse{
 			Success: false,
@@ -466,7 +485,7 @@ func (s *AuthServiceServerImpl) LogoutAllSessions(ctx context.Context, req *auth
 	log.Printf("LogoutAllSessions request received for client: %s", req.ClientId)
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.LogoutAllSessionsResponse{
 			Success: false,
@@ -504,7 +523,7 @@ func (s *AuthServiceServerImpl) GetUserSessions(ctx context.Context, req *authv1
 	log.Printf("GetUserSessions request received for client: %s", req.ClientId)
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.GetUserSessionsResponse{
 			Success: false,
@@ -559,7 +578,7 @@ func (s *AuthServiceServerImpl) RevokeSession(ctx context.Context, req *authv1.R
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.RevokeSessionResponse{
 			Success: false,
@@ -681,7 +700,7 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 	}
 
 	// Authenticate client
-	if err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
 		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.ChangeUserPasswordResponse{
 			Success: false,
@@ -766,7 +785,7 @@ func (s *AuthServiceServerImpl) ChangeClientSecret(ctx context.Context, req *aut
 	}
 
 	// Validate current secret
-	if err := s.authenticateClient(ctx, req.ClientId, req.CurrentSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.CurrentSecret); err != nil {
 		return &authv1.ChangeClientSecretResponse{Success: false, Message: "Invalid client credentials"}, nil
 	}
 
@@ -810,7 +829,7 @@ func (s *AuthServiceServerImpl) validateUserRegistration(req *authv1.RegisterUse
 		return fmt.Errorf("email is required")
 	}
 
-	if !s.isValidEmail(req.Email) {
+	if !isValidEmail(req.Email) {
 		return fmt.Errorf("invalid email format")
 	}
 
@@ -829,7 +848,7 @@ func (s *AuthServiceServerImpl) validateUserRegistration(req *authv1.RegisterUse
 	return nil
 }
 
-func (s *AuthServiceServerImpl) isValidEmail(email string) bool {
+func isValidEmail(email string) bool {
 	email = strings.TrimSpace(email)
 	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 	return emailRegex.MatchString(email)

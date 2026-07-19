@@ -1,0 +1,1065 @@
+package service
+
+import (
+	"authservice/pkg/models"
+	"authservice/pkg/repository"
+	"authservice/pkg/utils"
+	authv1 "authservice/proto/auth/v1"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
+)
+
+// PlatformClientID is the well-known client_id of the built-in platform
+// client. Developers are users of this client (dogfooding); the console's
+// superadmin check targets the object app:platform in this client's scope.
+const PlatformClientID = "platform"
+
+// Superadmin tuple coordinates (spec §8): app:platform admin user:<dev>.
+const (
+	platformObjectType   = "app"
+	platformObjectID     = "platform"
+	platformSuperRel     = "admin"
+	tupleSubjectTypeUser = "user"
+)
+
+// PlatformServiceServerImpl implements the Phase 2 tenant-management and
+// minimal-authz RPCs. Developer auth reuses the AuthService user/session/JWT
+// machinery via the built-in platform client.
+type PlatformServiceServerImpl struct {
+	authv1.UnimplementedPlatformServiceServer
+	repo *repository.AuthRepository
+}
+
+func NewPlatformServiceServer(db *gorm.DB) *PlatformServiceServerImpl {
+	return &PlatformServiceServerImpl{
+		repo: repository.NewAuthRepository(db),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+// BootstrapPlatform ensures the built-in platform org + client exist. The
+// client secret comes from PLATFORM_CLIENT_SECRET; when unset in dev a
+// secret is generated and logged ONCE. If the env secret changes, the stored
+// hash is re-synced so the env var stays the source of truth.
+func BootstrapPlatform(ctx context.Context, db *gorm.DB) error {
+	repo := repository.NewAuthRepository(db)
+	secret := os.Getenv("PLATFORM_CLIENT_SECRET")
+
+	client, err := repo.GetClientByID(ctx, PlatformClientID)
+	if err == nil {
+		// Already bootstrapped; re-sync the secret if the env var rotated it.
+		if secret != "" && !utils.CheckPasswordHash(secret, client.ClientSecretHash) {
+			hash, herr := utils.HashPassword(secret)
+			if herr != nil {
+				return fmt.Errorf("hashing platform client secret: %w", herr)
+			}
+			if uerr := repo.UpdateClientSecretHash(ctx, PlatformClientID, hash); uerr != nil {
+				return fmt.Errorf("updating platform client secret: %w", uerr)
+			}
+			log.Println("Platform client secret re-synced from PLATFORM_CLIENT_SECRET")
+		}
+		return nil
+	}
+
+	if secret == "" {
+		if !strings.EqualFold(os.Getenv("ENV"), "dev") {
+			return fmt.Errorf("PLATFORM_CLIENT_SECRET must be set (generated secrets are only allowed when ENV=dev)")
+		}
+		generated, gerr := utils.GenerateClientSecret()
+		if gerr != nil {
+			return fmt.Errorf("generating platform client secret: %w", gerr)
+		}
+		secret = generated
+		// Dev convenience: logged once at creation, never again.
+		log.Printf("Generated platform client secret (dev only, shown once): %s", secret)
+	}
+
+	hash, err := utils.HashPassword(secret)
+	if err != nil {
+		return fmt.Errorf("hashing platform client secret: %w", err)
+	}
+
+	org := &models.Organization{
+		OrgID: utils.GenerateUUID(),
+		Name:  "platform",
+	}
+	if err := repo.CreateOrganization(ctx, org); err != nil {
+		return fmt.Errorf("creating platform org: %w", err)
+	}
+
+	if err := repo.CreateClient(ctx, &models.Client{
+		ClientID:         PlatformClientID,
+		ClientName:       "platform",
+		ClientSecretHash: hash,
+		OrgID:            org.OrgID,
+		IdentityScope:    models.ScopeOrg,
+	}); err != nil {
+		return fmt.Errorf("creating platform client: %w", err)
+	}
+
+	log.Println("Platform org and client bootstrapped")
+	return nil
+}
+
+// superadminEmails parses the SUPERADMIN_EMAILS env var (comma-separated).
+func superadminEmails() map[string]bool {
+	emails := map[string]bool{}
+	for _, e := range strings.Split(os.Getenv("SUPERADMIN_EMAILS"), ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			emails[strings.ToLower(e)] = true
+		}
+	}
+	return emails
+}
+
+// grantSuperadmin ensures the (app:platform, admin, user:<dev>) allow tuple.
+func grantSuperadmin(ctx context.Context, repo *repository.AuthRepository, developerID string) error {
+	return repo.UpsertTuples(ctx, []models.RelationTuple{{
+		ClientID:    PlatformClientID,
+		ObjectType:  platformObjectType,
+		ObjectID:    platformObjectID,
+		Relation:    platformSuperRel,
+		SubjectType: tupleSubjectTypeUser,
+		SubjectID:   developerID,
+		Effect:      models.EffectAllow,
+	}})
+}
+
+// BootstrapSuperadmins seeds the superadmin tuple for every SUPERADMIN_EMAILS
+// entry that matches an existing developer. Unknown emails are skipped (the
+// grant is re-checked when a developer registers with a listed email).
+func BootstrapSuperadmins(ctx context.Context, db *gorm.DB) error {
+	repo := repository.NewAuthRepository(db)
+	for email := range superadminEmails() {
+		dev, err := repo.GetDeveloperByEmail(ctx, email)
+		if err != nil {
+			continue // not registered yet
+		}
+		if err := grantSuperadmin(ctx, repo, dev.DeveloperID); err != nil {
+			return fmt.Errorf("granting superadmin to developer %s: %w", dev.DeveloperID, err)
+		}
+		log.Printf("Superadmin tuple ensured for developer: %s", dev.DeveloperID)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+// authenticateDeveloper validates a platform-client access token
+// (revocation-aware) and returns the developer record.
+func (s *PlatformServiceServerImpl) authenticateDeveloper(ctx context.Context, accessToken string) (*models.Developer, error) {
+	claims, err := utils.ValidateJWTToken(accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("token validation failed: %w", err)
+	}
+	if claims.ClientID != PlatformClientID {
+		return nil, fmt.Errorf("token is not a platform token")
+	}
+	session, err := s.repo.GetSessionByID(ctx, claims.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session lookup failed: %w", err)
+	}
+	if session.UserID != claims.Subject || session.ClientID != claims.ClientID {
+		return nil, fmt.Errorf("session does not match token claims")
+	}
+	dev, err := s.repo.GetDeveloperByID(ctx, claims.Subject)
+	if err != nil {
+		return nil, fmt.Errorf("developer lookup failed: %w", err)
+	}
+	return dev, nil
+}
+
+// checkDirect is the Phase 2 minimal Check: exact tuple lookup only, no
+// implications or usersets (those arrive with the Phase 3 resolver).
+// Semantics: deny tuples win; allow requires an unconditioned exact match;
+// anything else is default deny. Conditioned tuples fail closed — a
+// conditioned deny still denies, a conditioned allow does not allow.
+func (s *PlatformServiceServerImpl) checkDirect(ctx context.Context, clientID, subjectType, subjectID, relation, objectType, objectID string) (bool, string, error) {
+	// Deny pass first (deny always wins).
+	denies, err := s.repo.FindMatchingTuples(ctx, clientID, objectType, objectID, relation, subjectType, subjectID, models.EffectDeny)
+	if err != nil {
+		return false, "", err
+	}
+	if len(denies) > 0 {
+		return false, "denied by explicit deny tuple", nil
+	}
+
+	// Allow pass: direct match; conditioned tuples fail closed in Phase 2.
+	allows, err := s.repo.FindMatchingTuples(ctx, clientID, objectType, objectID, relation, subjectType, subjectID, models.EffectAllow)
+	if err != nil {
+		return false, "", err
+	}
+	for _, t := range allows {
+		if strings.TrimSpace(t.ConditionExpr) == "" {
+			return true, "allowed by direct tuple", nil
+		}
+	}
+	if len(allows) > 0 {
+		return false, "matching tuple has a condition (conditions are evaluated in Phase 3; failing closed)", nil
+	}
+	return false, "no matching tuple (default deny)", nil
+}
+
+// isSuperadmin runs the spec §8 check: Check(platform, caller, admin,
+// app:platform).
+func (s *PlatformServiceServerImpl) isSuperadmin(ctx context.Context, developerID string) bool {
+	allowed, _, err := s.checkDirect(ctx, PlatformClientID, tupleSubjectTypeUser, developerID, platformSuperRel, platformObjectType, platformObjectID)
+	if err != nil {
+		log.Printf("Superadmin check failed for developer %s: %v", developerID, err)
+		return false
+	}
+	return allowed
+}
+
+// authorizeAppAccess loads an app and verifies the developer owns it (same
+// org) or is a superadmin.
+func (s *PlatformServiceServerImpl) authorizeAppAccess(ctx context.Context, dev *models.Developer, clientID string) (*models.Client, error) {
+	if clientID == "" {
+		return nil, fmt.Errorf("client_id is required")
+	}
+	client, err := s.repo.GetClientByID(ctx, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("app not found")
+	}
+	if client.OrgID != dev.OrgID && !s.isSuperadmin(ctx, dev.DeveloperID) {
+		return nil, fmt.Errorf("app does not belong to the developer's org")
+	}
+	return client, nil
+}
+
+// requireSuperadmin authenticates the token and enforces the superadmin
+// check server-side (UI hiding is never the security boundary).
+func (s *PlatformServiceServerImpl) requireSuperadmin(ctx context.Context, accessToken string) (*models.Developer, error) {
+	dev, err := s.authenticateDeveloper(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	if !s.isSuperadmin(ctx, dev.DeveloperID) {
+		return nil, fmt.Errorf("superadmin access required")
+	}
+	return dev, nil
+}
+
+func appToProto(c *models.Client) *authv1.App {
+	return &authv1.App{
+		ClientId:      c.ClientID,
+		Name:          c.ClientName,
+		OrgId:         c.OrgID,
+		IdentityScope: c.IdentityScope,
+		Suspended:     c.Suspended,
+		CreatedAt:     timestamppb.New(c.CreatedAt),
+	}
+}
+
+func validIdentityScope(scope string) bool {
+	return scope == models.ScopeApp || scope == models.ScopeOrg
+}
+
+// validateTuple checks the required tuple fields and normalizes the effect.
+func validateTuple(t *authv1.Tuple) (effect string, err error) {
+	if t.ObjectType == "" || t.ObjectId == "" || t.Relation == "" || t.SubjectType == "" || t.SubjectId == "" {
+		return "", fmt.Errorf("object_type, object_id, relation, subject_type, and subject_id are required")
+	}
+	switch t.Effect {
+	case "", models.EffectAllow:
+		return models.EffectAllow, nil
+	case models.EffectDeny:
+		return models.EffectDeny, nil
+	default:
+		return "", fmt.Errorf("effect must be 'allow' or 'deny'")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Developer accounts
+// ---------------------------------------------------------------------------
+
+func (s *PlatformServiceServerImpl) RegisterDeveloper(ctx context.Context, req *authv1.RegisterDeveloperRequest) (*authv1.RegisterDeveloperResponse, error) {
+	log.Printf("RegisterDeveloper request received")
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	fail := func(msg string) (*authv1.RegisterDeveloperResponse, error) {
+		return &authv1.RegisterDeveloperResponse{Success: false, Message: msg}, nil
+	}
+
+	if email == "" || !isValidEmail(email) {
+		return fail("A valid email is required")
+	}
+	if len(req.Password) < 8 {
+		return fail("Password must be at least 8 characters long")
+	}
+
+	platform, err := s.repo.GetClientByID(ctx, PlatformClientID)
+	if err != nil {
+		log.Printf("RegisterDeveloper: platform client missing: %v", err)
+		return fail("Internal server error")
+	}
+
+	// Developers live in the platform org's shared user pool.
+	exists, err := s.repo.IsEmailExists(ctx, email, models.ScopeOrg, platform.OrgID)
+	if err != nil {
+		log.Printf("RegisterDeveloper: email existence check failed: %v", err)
+		return fail("Internal server error")
+	}
+	if exists {
+		return fail("Email already registered")
+	}
+
+	hashedPassword, err := utils.HashPassword(req.Password)
+	if err != nil {
+		log.Printf("RegisterDeveloper: password hash failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	// Personal org, auto-created (GitHub-style).
+	orgName := strings.TrimSpace(req.OrgName)
+	if orgName == "" {
+		orgName = strings.SplitN(email, "@", 2)[0]
+	}
+	org := &models.Organization{OrgID: utils.GenerateUUID(), Name: orgName}
+	if err := s.repo.CreateOrganization(ctx, org); err != nil {
+		log.Printf("RegisterDeveloper: org creation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	userID := utils.GenerateUUID()
+	if err := s.repo.CreateUser(ctx, &models.User{
+		UserID:    userID,
+		UserName:  orgName,
+		Email:     email,
+		Password:  hashedPassword,
+		ScopeType: models.ScopeOrg,
+		ScopeID:   platform.OrgID,
+	}); err != nil {
+		log.Printf("RegisterDeveloper: user creation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	if err := s.repo.CreateDeveloper(ctx, &models.Developer{
+		DeveloperID: userID,
+		Email:       email,
+		OrgID:       org.OrgID,
+	}); err != nil {
+		log.Printf("RegisterDeveloper: developer creation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	// Re-run the superadmin bootstrap check for freshly registered emails.
+	if superadminEmails()[email] {
+		if err := grantSuperadmin(ctx, s.repo, userID); err != nil {
+			log.Printf("RegisterDeveloper: superadmin grant failed for developer %s: %v", userID, err)
+		} else {
+			log.Printf("Superadmin tuple granted to developer: %s", userID)
+		}
+	}
+
+	log.Printf("Developer registered successfully: %s (org: %s)", userID, org.OrgID)
+	return &authv1.RegisterDeveloperResponse{
+		Success:     true,
+		Message:     "Developer registered successfully",
+		DeveloperId: userID,
+		OrgId:       org.OrgID,
+	}, nil
+}
+
+func (s *PlatformServiceServerImpl) DeveloperLogin(ctx context.Context, req *authv1.DeveloperLoginRequest) (*authv1.DeveloperLoginResponse, error) {
+	log.Printf("DeveloperLogin request received")
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	fail := func(msg string) (*authv1.DeveloperLoginResponse, error) {
+		return &authv1.DeveloperLoginResponse{Success: false, Message: msg}, nil
+	}
+
+	if email == "" || req.Password == "" {
+		return fail("Email and password are required")
+	}
+
+	platform, err := s.repo.GetClientByID(ctx, PlatformClientID)
+	if err != nil {
+		log.Printf("DeveloperLogin: platform client missing: %v", err)
+		return fail("Internal server error")
+	}
+
+	user, err := s.repo.GetUserByEmail(ctx, email, models.ScopeOrg, platform.OrgID)
+	if err != nil {
+		log.Printf("DeveloperLogin failed: user lookup error")
+		return fail("Invalid credentials")
+	}
+	if !utils.CheckPasswordHash(req.Password, user.Password) {
+		log.Printf("DeveloperLogin failed for user %s", user.UserID)
+		return fail("Invalid credentials")
+	}
+
+	dev, err := s.repo.GetDeveloperByID(ctx, user.UserID)
+	if err != nil {
+		log.Printf("DeveloperLogin failed: developer record missing for user %s", user.UserID)
+		return fail("Invalid credentials")
+	}
+
+	// Session + tokens: same machinery as end-user logins (dogfooding).
+	sessionID := utils.GenerateUUID()
+	refreshToken, refreshHash, err := utils.GenerateRefreshToken(sessionID)
+	if err != nil {
+		log.Printf("DeveloperLogin: refresh token generation failed: %v", err)
+		return fail("Internal server error")
+	}
+	if err := s.repo.CreateSession(ctx, &models.Session{
+		SessionID:        sessionID,
+		UserID:           user.UserID,
+		ClientID:         PlatformClientID,
+		RefreshTokenHash: refreshHash,
+		UserAgent:        req.UserAgent,
+		ExpiresAt:        time.Now().Add(refreshTokenLifetime),
+	}); err != nil {
+		log.Printf("DeveloperLogin: session creation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	accessToken, _, err := utils.GenerateJWTToken(user.UserID, PlatformClientID, sessionID)
+	if err != nil {
+		log.Printf("DeveloperLogin: JWT generation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	orgName := ""
+	if org, err := s.repo.GetOrganizationByID(ctx, dev.OrgID); err == nil {
+		orgName = org.Name
+	}
+
+	log.Printf("Developer logged in successfully: %s (session: %s)", user.UserID, sessionID)
+	return &authv1.DeveloperLoginResponse{
+		Success:      true,
+		Message:      "Login successful",
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		Developer: &authv1.Developer{
+			DeveloperId: dev.DeveloperID,
+			Email:       dev.Email,
+			OrgId:       dev.OrgID,
+			OrgName:     orgName,
+		},
+		IsSuperadmin: s.isSuperadmin(ctx, dev.DeveloperID),
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// App management
+// ---------------------------------------------------------------------------
+
+func (s *PlatformServiceServerImpl) CreateApp(ctx context.Context, req *authv1.CreateAppRequest) (*authv1.CreateAppResponse, error) {
+	log.Printf("CreateApp request received")
+
+	fail := func(msg string) (*authv1.CreateAppResponse, error) {
+		return &authv1.CreateAppResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("CreateApp: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+
+	if strings.TrimSpace(req.Name) == "" {
+		return fail("App name is required")
+	}
+	identityScope := req.IdentityScope
+	if identityScope == "" {
+		identityScope = models.ScopeApp
+	}
+	if !validIdentityScope(identityScope) {
+		return fail("identity_scope must be 'app' or 'org'")
+	}
+
+	clientID := utils.GenerateUUID()
+	clientSecret, err := utils.GenerateClientSecret()
+	if err != nil {
+		log.Printf("CreateApp: secret generation failed: %v", err)
+		return fail("Internal server error")
+	}
+	secretHash, err := utils.HashPassword(clientSecret)
+	if err != nil {
+		log.Printf("CreateApp: secret hash failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	client := &models.Client{
+		ClientID:         clientID,
+		ClientName:       strings.TrimSpace(req.Name),
+		ClientSecretHash: secretHash,
+		OrgID:            dev.OrgID,
+		IdentityScope:    identityScope,
+	}
+	if err := s.repo.CreateClient(ctx, client); err != nil {
+		log.Printf("CreateApp: client creation failed: %v", err)
+		return fail("Failed to create app")
+	}
+
+	log.Printf("App created: %s (org: %s, developer: %s)", clientID, dev.OrgID, dev.DeveloperID)
+	return &authv1.CreateAppResponse{
+		Success:      true,
+		Message:      "App created successfully",
+		App:          appToProto(client),
+		ClientSecret: clientSecret, // shown once; only the bcrypt hash is stored
+	}, nil
+}
+
+func (s *PlatformServiceServerImpl) ListApps(ctx context.Context, req *authv1.ListAppsRequest) (*authv1.ListAppsResponse, error) {
+	log.Printf("ListApps request received")
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("ListApps: developer authentication failed: %v", err)
+		return &authv1.ListAppsResponse{Success: false, Message: "Invalid token"}, nil
+	}
+
+	clients, err := s.repo.ListClientsByOrg(ctx, dev.OrgID)
+	if err != nil {
+		log.Printf("ListApps: listing failed for org %s: %v", dev.OrgID, err)
+		return &authv1.ListAppsResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	apps := make([]*authv1.App, 0, len(clients))
+	for i := range clients {
+		apps = append(apps, appToProto(&clients[i]))
+	}
+	return &authv1.ListAppsResponse{Success: true, Message: "Apps retrieved successfully", Apps: apps}, nil
+}
+
+func (s *PlatformServiceServerImpl) UpdateApp(ctx context.Context, req *authv1.UpdateAppRequest) (*authv1.UpdateAppResponse, error) {
+	log.Printf("UpdateApp request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.UpdateAppResponse, error) {
+		return &authv1.UpdateAppResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("UpdateApp: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("UpdateApp: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	if req.Name != nil {
+		if strings.TrimSpace(*req.Name) == "" {
+			return fail("App name cannot be empty")
+		}
+		client.ClientName = strings.TrimSpace(*req.Name)
+	}
+	if req.IdentityScope != nil {
+		if !validIdentityScope(*req.IdentityScope) {
+			return fail("identity_scope must be 'app' or 'org'")
+		}
+		client.IdentityScope = *req.IdentityScope
+	}
+
+	if err := s.repo.UpdateClient(ctx, client); err != nil {
+		log.Printf("UpdateApp: update failed for client %s: %v", req.ClientId, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("App updated: %s (developer: %s)", client.ClientID, dev.DeveloperID)
+	return &authv1.UpdateAppResponse{Success: true, Message: "App updated successfully", App: appToProto(client)}, nil
+}
+
+func (s *PlatformServiceServerImpl) RotateAppSecret(ctx context.Context, req *authv1.RotateAppSecretRequest) (*authv1.RotateAppSecretResponse, error) {
+	log.Printf("RotateAppSecret request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.RotateAppSecretResponse, error) {
+		return &authv1.RotateAppSecretResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("RotateAppSecret: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("RotateAppSecret: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	newSecret, err := utils.GenerateClientSecret()
+	if err != nil {
+		log.Printf("RotateAppSecret: secret generation failed: %v", err)
+		return fail("Internal server error")
+	}
+	newHash, err := utils.HashPassword(newSecret)
+	if err != nil {
+		log.Printf("RotateAppSecret: secret hash failed: %v", err)
+		return fail("Internal server error")
+	}
+	if err := s.repo.UpdateClientSecretHash(ctx, client.ClientID, newHash); err != nil {
+		log.Printf("RotateAppSecret: update failed for client %s: %v", client.ClientID, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("App secret rotated: %s (developer: %s)", client.ClientID, dev.DeveloperID)
+	return &authv1.RotateAppSecretResponse{
+		Success:      true,
+		Message:      "App secret rotated successfully",
+		ClientSecret: newSecret, // shown once; only the bcrypt hash is stored
+	}, nil
+}
+
+func (s *PlatformServiceServerImpl) DeleteApp(ctx context.Context, req *authv1.DeleteAppRequest) (*authv1.DeleteAppResponse, error) {
+	log.Printf("DeleteApp request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.DeleteAppResponse, error) {
+		return &authv1.DeleteAppResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("DeleteApp: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+
+	if req.ClientId == PlatformClientID {
+		return fail("The platform client cannot be deleted")
+	}
+
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("DeleteApp: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	if err := s.repo.DeleteClient(ctx, client.ClientID); err != nil {
+		log.Printf("DeleteApp: delete failed for client %s: %v", client.ClientID, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("App deleted: %s (developer: %s)", client.ClientID, dev.DeveloperID)
+	return &authv1.DeleteAppResponse{Success: true, Message: "App deleted successfully"}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Authorization (minimal Phase 2 engine)
+// ---------------------------------------------------------------------------
+
+func (s *PlatformServiceServerImpl) Check(ctx context.Context, req *authv1.CheckRequest) (*authv1.CheckResponse, error) {
+	log.Printf("Check request received")
+
+	deny := func(reason string) (*authv1.CheckResponse, error) {
+		return &authv1.CheckResponse{Allowed: false, Reason: reason}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		return deny("invalid token")
+	}
+
+	// Resolve the tuple scope: empty defaults to the platform client (the
+	// console's superadmin gate); any developer may query the platform
+	// scope, but per-app scopes require ownership (or superadmin).
+	clientID := req.ClientId
+	if clientID == "" {
+		clientID = PlatformClientID
+	}
+	if clientID != PlatformClientID {
+		if _, err := s.authorizeAppAccess(ctx, dev, clientID); err != nil {
+			log.Printf("Check: ownership check failed for client %s (developer: %s): %v", clientID, dev.DeveloperID, err)
+			return deny("app not found")
+		}
+	}
+
+	subjectType, subjectID, ok := strings.Cut(req.Subject, ":")
+	if !ok || subjectType == "" || subjectID == "" {
+		return deny("subject must be of the form 'type:id'")
+	}
+	if req.Relation == "" || req.ObjectType == "" || req.ObjectId == "" {
+		return deny("relation, object_type, and object_id are required")
+	}
+
+	allowed, reason, err := s.checkDirect(ctx, clientID, subjectType, subjectID, req.Relation, req.ObjectType, req.ObjectId)
+	if err != nil {
+		log.Printf("Check: tuple lookup failed (client: %s): %v", clientID, err)
+		return deny("internal error (failing closed)")
+	}
+	return &authv1.CheckResponse{Allowed: allowed, Reason: reason}, nil
+}
+
+func (s *PlatformServiceServerImpl) WriteTuples(ctx context.Context, req *authv1.WriteTuplesRequest) (*authv1.WriteTuplesResponse, error) {
+	log.Printf("WriteTuples request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.WriteTuplesResponse, error) {
+		return &authv1.WriteTuplesResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("WriteTuples: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("WriteTuples: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+	if len(req.Tuples) == 0 {
+		return fail("At least one tuple is required")
+	}
+
+	tuples := make([]models.RelationTuple, 0, len(req.Tuples))
+	for _, t := range req.Tuples {
+		effect, verr := validateTuple(t)
+		if verr != nil {
+			return fail(verr.Error())
+		}
+		tuples = append(tuples, models.RelationTuple{
+			ClientID:      client.ClientID,
+			ObjectType:    t.ObjectType,
+			ObjectID:      t.ObjectId,
+			Relation:      t.Relation,
+			SubjectType:   t.SubjectType,
+			SubjectID:     t.SubjectId,
+			Effect:        effect,
+			ConditionExpr: t.ConditionExpr,
+		})
+	}
+
+	if err := s.repo.UpsertTuples(ctx, tuples); err != nil {
+		log.Printf("WriteTuples: write failed for client %s: %v", client.ClientID, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("Tuples written: %d (client: %s, developer: %s)", len(tuples), client.ClientID, dev.DeveloperID)
+	return &authv1.WriteTuplesResponse{Success: true, Message: "Tuples written successfully"}, nil
+}
+
+func (s *PlatformServiceServerImpl) DeleteTuples(ctx context.Context, req *authv1.DeleteTuplesRequest) (*authv1.DeleteTuplesResponse, error) {
+	log.Printf("DeleteTuples request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.DeleteTuplesResponse, error) {
+		return &authv1.DeleteTuplesResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("DeleteTuples: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("DeleteTuples: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+	if len(req.Tuples) == 0 {
+		return fail("At least one tuple is required")
+	}
+
+	for _, t := range req.Tuples {
+		effect, verr := validateTuple(t)
+		if verr != nil {
+			return fail(verr.Error())
+		}
+		if err := s.repo.DeleteTuple(ctx, &models.RelationTuple{
+			ClientID:    client.ClientID,
+			ObjectType:  t.ObjectType,
+			ObjectID:    t.ObjectId,
+			Relation:    t.Relation,
+			SubjectType: t.SubjectType,
+			SubjectID:   t.SubjectId,
+			Effect:      effect,
+		}); err != nil {
+			log.Printf("DeleteTuples: delete failed for client %s: %v", client.ClientID, err)
+			return fail("Internal server error")
+		}
+	}
+
+	log.Printf("Tuples deleted: %d (client: %s, developer: %s)", len(req.Tuples), client.ClientID, dev.DeveloperID)
+	return &authv1.DeleteTuplesResponse{Success: true, Message: "Tuples deleted successfully"}, nil
+}
+
+func (s *PlatformServiceServerImpl) ListTuples(ctx context.Context, req *authv1.ListTuplesRequest) (*authv1.ListTuplesResponse, error) {
+	log.Printf("ListTuples request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.ListTuplesResponse, error) {
+		return &authv1.ListTuplesResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("ListTuples: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("ListTuples: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	filter := req.Filter
+	if filter == nil {
+		filter = &authv1.TupleFilter{}
+	}
+	tuples, err := s.repo.ListTuples(ctx, client.ClientID, filter.ObjectType, filter.ObjectId, filter.SubjectType, filter.SubjectId)
+	if err != nil {
+		log.Printf("ListTuples: listing failed for client %s: %v", client.ClientID, err)
+		return fail("Internal server error")
+	}
+
+	out := make([]*authv1.Tuple, 0, len(tuples))
+	for _, t := range tuples {
+		out = append(out, &authv1.Tuple{
+			ObjectType:    t.ObjectType,
+			ObjectId:      t.ObjectID,
+			Relation:      t.Relation,
+			SubjectType:   t.SubjectType,
+			SubjectId:     t.SubjectID,
+			Effect:        t.Effect,
+			ConditionExpr: t.ConditionExpr,
+		})
+	}
+	return &authv1.ListTuplesResponse{Success: true, Message: "Tuples retrieved successfully", Tuples: out}, nil
+}
+
+func (s *PlatformServiceServerImpl) WriteAuthzModel(ctx context.Context, req *authv1.WriteAuthzModelRequest) (*authv1.WriteAuthzModelResponse, error) {
+	log.Printf("WriteAuthzModel request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.WriteAuthzModelResponse, error) {
+		return &authv1.WriteAuthzModelResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("WriteAuthzModel: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("WriteAuthzModel: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	// Phase 2 only validates well-formedness; the Phase 3 resolver will
+	// validate vocabulary semantics.
+	if !json.Valid([]byte(req.ModelJson)) {
+		return fail("model_json must be well-formed JSON")
+	}
+
+	version, err := s.repo.CreateAuthzModelVersion(ctx, client.ClientID, req.ModelJson)
+	if err != nil {
+		log.Printf("WriteAuthzModel: write failed for client %s: %v", client.ClientID, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("Authz model v%d written (client: %s, developer: %s)", version, client.ClientID, dev.DeveloperID)
+	return &authv1.WriteAuthzModelResponse{Success: true, Message: "Authz model written successfully", Version: version}, nil
+}
+
+func (s *PlatformServiceServerImpl) GetAuthzModel(ctx context.Context, req *authv1.GetAuthzModelRequest) (*authv1.GetAuthzModelResponse, error) {
+	log.Printf("GetAuthzModel request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.GetAuthzModelResponse, error) {
+		return &authv1.GetAuthzModelResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("GetAuthzModel: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+	client, err := s.authorizeAppAccess(ctx, dev, req.ClientId)
+	if err != nil {
+		log.Printf("GetAuthzModel: ownership check failed for client %s (developer: %s): %v", req.ClientId, dev.DeveloperID, err)
+		return fail("App not found")
+	}
+
+	model, err := s.repo.GetLatestAuthzModel(ctx, client.ClientID)
+	if err != nil {
+		// No model yet is not an error: the console maps an empty
+		// model_json to null.
+		return &authv1.GetAuthzModelResponse{Success: true, Message: "No authz model written yet"}, nil
+	}
+	return &authv1.GetAuthzModelResponse{
+		Success:   true,
+		Message:   "Authz model retrieved successfully",
+		ModelJson: model.ModelJSON,
+		Version:   model.Version,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Superadmin-only RPCs
+// ---------------------------------------------------------------------------
+
+func (s *PlatformServiceServerImpl) ListAllOrgs(ctx context.Context, req *authv1.ListAllOrgsRequest) (*authv1.ListAllOrgsResponse, error) {
+	log.Printf("ListAllOrgs request received")
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("ListAllOrgs rejected: %v", err)
+		return &authv1.ListAllOrgsResponse{Success: false, Message: "Superadmin access required"}, nil
+	}
+
+	orgs, err := s.repo.ListOrganizations(ctx)
+	if err != nil {
+		log.Printf("ListAllOrgs: listing failed: %v", err)
+		return &authv1.ListAllOrgsResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	out := make([]*authv1.Org, 0, len(orgs))
+	for _, o := range orgs {
+		out = append(out, &authv1.Org{
+			OrgId:     o.OrgID,
+			Name:      o.Name,
+			CreatedAt: timestamppb.New(o.CreatedAt),
+		})
+	}
+	return &authv1.ListAllOrgsResponse{Success: true, Message: "Orgs retrieved successfully", Orgs: out}, nil
+}
+
+func (s *PlatformServiceServerImpl) ListAllApps(ctx context.Context, req *authv1.ListAllAppsRequest) (*authv1.ListAllAppsResponse, error) {
+	log.Printf("ListAllApps request received")
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("ListAllApps rejected: %v", err)
+		return &authv1.ListAllAppsResponse{Success: false, Message: "Superadmin access required"}, nil
+	}
+
+	clients, err := s.repo.ListAllClients(ctx)
+	if err != nil {
+		log.Printf("ListAllApps: listing failed: %v", err)
+		return &authv1.ListAllAppsResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	apps := make([]*authv1.App, 0, len(clients))
+	for i := range clients {
+		apps = append(apps, appToProto(&clients[i]))
+	}
+	return &authv1.ListAllAppsResponse{Success: true, Message: "Apps retrieved successfully", Apps: apps}, nil
+}
+
+func (s *PlatformServiceServerImpl) SuspendClient(ctx context.Context, req *authv1.SuspendClientRequest) (*authv1.SuspendClientResponse, error) {
+	log.Printf("SuspendClient request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.SuspendClientResponse, error) {
+		return &authv1.SuspendClientResponse{Success: false, Message: msg}, nil
+	}
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("SuspendClient rejected: %v", err)
+		return fail("Superadmin access required")
+	}
+	if req.ClientId == PlatformClientID {
+		return fail("The platform client cannot be suspended")
+	}
+	if _, err := s.repo.GetClientByID(ctx, req.ClientId); err != nil {
+		return fail("App not found")
+	}
+	if err := s.repo.SetClientSuspended(ctx, req.ClientId, true); err != nil {
+		log.Printf("SuspendClient: update failed for client %s: %v", req.ClientId, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("Client suspended: %s", req.ClientId)
+	return &authv1.SuspendClientResponse{Success: true, Message: "Client suspended"}, nil
+}
+
+func (s *PlatformServiceServerImpl) RestoreClient(ctx context.Context, req *authv1.RestoreClientRequest) (*authv1.RestoreClientResponse, error) {
+	log.Printf("RestoreClient request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.RestoreClientResponse, error) {
+		return &authv1.RestoreClientResponse{Success: false, Message: msg}, nil
+	}
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("RestoreClient rejected: %v", err)
+		return fail("Superadmin access required")
+	}
+	if _, err := s.repo.GetClientByID(ctx, req.ClientId); err != nil {
+		return fail("App not found")
+	}
+	if err := s.repo.SetClientSuspended(ctx, req.ClientId, false); err != nil {
+		log.Printf("RestoreClient: update failed for client %s: %v", req.ClientId, err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("Client restored: %s", req.ClientId)
+	return &authv1.RestoreClientResponse{Success: true, Message: "Client restored"}, nil
+}
+
+func (s *PlatformServiceServerImpl) ListDevelopers(ctx context.Context, req *authv1.ListDevelopersRequest) (*authv1.ListDevelopersResponse, error) {
+	log.Printf("ListDevelopers request received")
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("ListDevelopers rejected: %v", err)
+		return &authv1.ListDevelopersResponse{Success: false, Message: "Superadmin access required"}, nil
+	}
+
+	devs, err := s.repo.ListDevelopers(ctx)
+	if err != nil {
+		log.Printf("ListDevelopers: listing failed: %v", err)
+		return &authv1.ListDevelopersResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	// Resolve org names in one pass.
+	orgNames := map[string]string{}
+	if orgs, err := s.repo.ListOrganizations(ctx); err == nil {
+		for _, o := range orgs {
+			orgNames[o.OrgID] = o.Name
+		}
+	}
+
+	out := make([]*authv1.DeveloperInfo, 0, len(devs))
+	for _, d := range devs {
+		out = append(out, &authv1.DeveloperInfo{
+			DeveloperId: d.DeveloperID,
+			Email:       d.Email,
+			OrgId:       d.OrgID,
+			OrgName:     orgNames[d.OrgID],
+			CreatedAt:   timestamppb.New(d.CreatedAt),
+		})
+	}
+	return &authv1.ListDevelopersResponse{Success: true, Message: "Developers retrieved successfully", Developers: out}, nil
+}
+
+func (s *PlatformServiceServerImpl) GetPlatformMetrics(ctx context.Context, req *authv1.GetPlatformMetricsRequest) (*authv1.GetPlatformMetricsResponse, error) {
+	log.Printf("GetPlatformMetrics request received")
+
+	if _, err := s.requireSuperadmin(ctx, req.AccessToken); err != nil {
+		log.Printf("GetPlatformMetrics rejected: %v", err)
+		return &authv1.GetPlatformMetricsResponse{Success: false, Message: "Superadmin access required"}, nil
+	}
+
+	resp := &authv1.GetPlatformMetricsResponse{Success: true, Message: "Metrics retrieved successfully"}
+	for _, c := range []struct {
+		dst   *int64
+		count func(context.Context) (int64, error)
+	}{
+		{&resp.Developers, s.repo.CountDevelopers},
+		{&resp.Orgs, s.repo.CountOrganizations},
+		{&resp.Apps, s.repo.CountClients},
+		{&resp.Users, s.repo.CountUsers},
+		{&resp.ActiveSessions, s.repo.CountActiveSessions},
+		{&resp.Tuples, s.repo.CountTuples},
+	} {
+		n, err := c.count(ctx)
+		if err != nil {
+			log.Printf("GetPlatformMetrics: count failed: %v", err)
+			return &authv1.GetPlatformMetricsResponse{Success: false, Message: "Internal server error"}, nil
+		}
+		*c.dst = n
+	}
+	return resp, nil
+}

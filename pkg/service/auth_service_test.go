@@ -75,11 +75,12 @@ func seedUser(t *testing.T, db *gorm.DB, userID, clientID, email, username, rawP
 		t.Fatalf("failed to hash password: %v", err)
 	}
 	user := &models.User{
-		UserID:   userID,
-		UserName: username,
-		Email:    email,
-		Password: hashed,
-		ClientID: clientID,
+		UserID:    userID,
+		UserName:  username,
+		Email:     email,
+		Password:  hashed,
+		ScopeType: models.ScopeApp,
+		ScopeID:   clientID,
 	}
 	if err := repo.CreateUser(context.Background(), user); err != nil {
 		t.Fatalf("failed to seed user: %v", err)
@@ -722,10 +723,10 @@ func TestChangeClientSecret_AdminSecret(t *testing.T) {
 	}
 
 	// old secret no longer authenticates
-	if err := svc.authenticateClient(context.Background(), "client-1", testClientSecret); err == nil {
+	if _, err := svc.authenticateClient(context.Background(), "client-1", testClientSecret); err == nil {
 		t.Fatalf("expected old client secret to be rejected after rotation")
 	}
-	if err := svc.authenticateClient(context.Background(), "client-1", resp.ClientSecret); err != nil {
+	if _, err := svc.authenticateClient(context.Background(), "client-1", resp.ClientSecret); err != nil {
 		t.Fatalf("expected new client secret to authenticate: %v", err)
 	}
 }

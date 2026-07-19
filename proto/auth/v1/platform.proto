@@ -1,0 +1,331 @@
+syntax = "proto3";
+
+package auth.v1;
+
+// Use module import path with package alias for Go codegen
+option go_package = "./proto/auth/v1";
+
+import "google/protobuf/timestamp.proto";
+
+// PlatformService is the Phase 2 tenant-management + minimal authz surface.
+// Developers are users of the built-in "platform" client (dogfooding the
+// AuthService user/session/JWT machinery); all RPCs below authenticate via
+// a developer access token unless noted otherwise.
+service PlatformService {
+  // Developer accounts
+  // Registers a developer and auto-creates their personal organization
+  rpc RegisterDeveloper(RegisterDeveloperRequest) returns (RegisterDeveloperResponse);
+  // Logs a developer in (platform client) and returns tokens + profile
+  rpc DeveloperLogin(DeveloperLoginRequest) returns (DeveloperLoginResponse);
+
+  // App (client) management — developer token + org ownership required
+  // Creates an app under the developer's org; secret is returned once
+  rpc CreateApp(CreateAppRequest) returns (CreateAppResponse);
+  // Lists the developer's own org's apps
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+  // Updates an app's name and/or identity_scope
+  rpc UpdateApp(UpdateAppRequest) returns (UpdateAppResponse);
+  // Rotates an app's secret; the new secret is returned once
+  rpc RotateAppSecret(RotateAppSecretRequest) returns (RotateAppSecretResponse);
+  // Soft-deletes an app
+  rpc DeleteApp(DeleteAppRequest) returns (DeleteAppResponse);
+
+  // Authorization (minimal Phase 2 engine: direct tuple lookup only,
+  // deny wins, default deny; full resolver lands in Phase 3)
+  // Evaluates a check in the calling token's client scope
+  rpc Check(CheckRequest) returns (CheckResponse);
+  // Writes (upserts) relation tuples for an app the developer owns
+  rpc WriteTuples(WriteTuplesRequest) returns (WriteTuplesResponse);
+  // Deletes relation tuples for an app the developer owns
+  rpc DeleteTuples(DeleteTuplesRequest) returns (DeleteTuplesResponse);
+  // Lists relation tuples for an app the developer owns
+  rpc ListTuples(ListTuplesRequest) returns (ListTuplesResponse);
+  // Stores a new version of an app's authz model (validated as JSON)
+  rpc WriteAuthzModel(WriteAuthzModelRequest) returns (WriteAuthzModelResponse);
+  // Returns the latest version of an app's authz model
+  rpc GetAuthzModel(GetAuthzModelRequest) returns (GetAuthzModelResponse);
+
+  // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
+  rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
+  rpc ListAllApps(ListAllAppsRequest) returns (ListAllAppsResponse);
+  rpc SuspendClient(SuspendClientRequest) returns (SuspendClientResponse);
+  rpc RestoreClient(RestoreClientRequest) returns (RestoreClientResponse);
+  rpc ListDevelopers(ListDevelopersRequest) returns (ListDevelopersResponse);
+  rpc GetPlatformMetrics(GetPlatformMetricsRequest) returns (GetPlatformMetricsResponse);
+}
+
+// A registered application (client). The tenant boundary.
+message App {
+  string client_id = 1;
+  string name = 2;
+  string org_id = 3;
+  string identity_scope = 4; // 'app' | 'org'
+  bool suspended = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message Developer {
+  string developer_id = 1;
+  string email = 2;
+  string org_id = 3;
+  string org_name = 4;
+}
+
+message Org {
+  string org_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
+// One access fact: subject has relation on object (within a client scope).
+message Tuple {
+  string object_type = 1;
+  string object_id = 2;
+  string relation = 3;
+  string subject_type = 4; // 'user' | 'role'
+  string subject_id = 5;
+  string effect = 6;         // 'allow' (default) | 'deny'
+  string condition_expr = 7; // optional ABAC condition (evaluated in Phase 3)
+}
+
+message RegisterDeveloperRequest {
+  string email = 1;
+  string password = 2;
+  string org_name = 3; // optional; defaults to a name derived from the email
+}
+
+message RegisterDeveloperResponse {
+  bool success = 1;
+  string message = 2;
+  string developer_id = 3;
+  string org_id = 4;
+}
+
+message DeveloperLoginRequest {
+  string email = 1;
+  string password = 2;
+  string user_agent = 3; // optional
+}
+
+message DeveloperLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  Developer developer = 5;
+  bool is_superadmin = 6;
+}
+
+message CreateAppRequest {
+  string access_token = 1;
+  string name = 2;
+  string identity_scope = 3; // 'app' (default) | 'org'
+}
+
+message CreateAppResponse {
+  bool success = 1;
+  string message = 2;
+  App app = 3;
+  string client_secret = 4; // shown once; only a bcrypt hash is stored
+}
+
+message ListAppsRequest {
+  string access_token = 1;
+}
+
+message ListAppsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated App apps = 3;
+}
+
+message UpdateAppRequest {
+  string access_token = 1;
+  string client_id = 2;
+  optional string name = 3;           // unset = unchanged
+  optional string identity_scope = 4; // unset = unchanged
+}
+
+message UpdateAppResponse {
+  bool success = 1;
+  string message = 2;
+  App app = 3;
+}
+
+message RotateAppSecretRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message RotateAppSecretResponse {
+  bool success = 1;
+  string message = 2;
+  string client_secret = 3; // shown once; only a bcrypt hash is stored
+}
+
+message DeleteAppRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message DeleteAppResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CheckRequest {
+  string access_token = 1;
+  string subject = 2; // "type:id", e.g. "user:1234"
+  string relation = 3;
+  string object_type = 4;
+  string object_id = 5;
+  map<string, string> context = 6; // ABAC context (evaluated in Phase 3)
+  // Tuple scope to evaluate in. Empty defaults to the platform client
+  // (used by the console's superadmin gate). Non-platform scopes require
+  // the calling developer to own the app (or be a superadmin).
+  string client_id = 7;
+}
+
+message CheckResponse {
+  bool allowed = 1;
+  string reason = 2;
+}
+
+message WriteTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  repeated Tuple tuples = 3;
+}
+
+message WriteTuplesResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  repeated Tuple tuples = 3;
+}
+
+message DeleteTuplesResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// All filter fields are optional; empty means "any".
+message TupleFilter {
+  string object_type = 1;
+  string object_id = 2;
+  string subject_type = 3;
+  string subject_id = 4;
+}
+
+message ListTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  TupleFilter filter = 3;
+}
+
+message ListTuplesResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Tuple tuples = 3;
+}
+
+message WriteAuthzModelRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string model_json = 3;
+}
+
+message WriteAuthzModelResponse {
+  bool success = 1;
+  string message = 2;
+  int32 version = 3;
+}
+
+message GetAuthzModelRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message GetAuthzModelResponse {
+  bool success = 1;
+  string message = 2;
+  string model_json = 3;
+  int32 version = 4;
+}
+
+message ListAllOrgsRequest {
+  string access_token = 1;
+}
+
+message ListAllOrgsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Org orgs = 3;
+}
+
+message ListAllAppsRequest {
+  string access_token = 1;
+}
+
+message ListAllAppsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated App apps = 3;
+}
+
+message SuspendClientRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message SuspendClientResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RestoreClientRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message RestoreClientResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListDevelopersRequest {
+  string access_token = 1;
+}
+
+message DeveloperInfo {
+  string developer_id = 1;
+  string email = 2;
+  string org_id = 3;
+  string org_name = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message ListDevelopersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated DeveloperInfo developers = 3;
+}
+
+message GetPlatformMetricsRequest {
+  string access_token = 1;
+}
+
+message GetPlatformMetricsResponse {
+  bool success = 1;
+  string message = 2;
+  int64 developers = 3;
+  int64 orgs = 4;
+  int64 apps = 5;
+  int64 users = 6;
+  int64 active_sessions = 7;
+  int64 tuples = 8;
+}
