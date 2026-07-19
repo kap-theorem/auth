@@ -179,6 +179,21 @@ Sandboxed, no side effects; parse errors fail closed (deny).
 - Out of scope for v1: `InviteDeveloper` / multi-member orgs, billing,
   per-client password policies, open-vs-invite user signup policy.
 
+### Hosted login (added 2026-07-18 for wordskali migration)
+Apps may delegate end-user login to a page hosted by the platform (iframe or
+redirect), so they never handle passwords:
+- Client gains `redirect_uris` (whitelist) — editable in the console.
+- `GetAppPublicInfo{client_id}` → {name, hosted_login_enabled} (public).
+- `HostedLogin{client_id, email, password, redirect_uri}` — client-secret-free
+  login usable ONLY when the redirect_uri exactly matches the app's whitelist;
+  returns the normal token pair. Rate-limited like GetToken.
+- The console serves the public page `/client/{client_id}/user/login?redirect=…`
+  which posts HostedLogin and delivers the access token to the opener via
+  `postMessage({type:"AUTH_SUCCESS", access_token})` (iframe flow).
+- `Check` and `ValidateToken` additionally accept client_id+client_secret
+  authentication (machine-to-machine, no developer token) scoped to that
+  client — needed by app backends like wordskali.
+
 ## 8. Console (frontend) — auth.kaplabs.dev
 
 Browser SPA served by the same deployment; talks JSON to the service via
