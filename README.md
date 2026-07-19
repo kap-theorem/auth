@@ -291,6 +291,85 @@ grpcurl -plaintext -d '{"email": "john@example.com", "password": "password123", 
 5. **Token Refresh**: Use `refresh_token` to get new tokens when access token expires
 6. **Logout**: Invalidate session when user logs out
 
+## Authorization Engine
+
+The `PlatformService` includes a relationship-based authorization engine
+(`pkg/authz`): apps declare their own vocabulary in a versioned **authz
+model**, grant access with **relation tuples**, and evaluate access with
+`Check` / `ListObjects`.
+
+### Authz model schema
+
+`WriteAuthzModel` validates model JSON against this schema (the same shape
+the console uses):
+
+```json
+{
+  "types": {
+    "problem": {
+      "relations": {
+        "author": [],
+        "editor": ["author"],
+        "viewer": ["editor"]
+      }
+    }
+  }
+}
+```
+
+- Each object type declares its relations; a relation maps to the list of
+  **stronger relations that imply it** (`"viewer": ["editor"]` = an editor
+  is also a viewer). Implications chain transitively: checking `viewer`
+  accepts `author`/`editor`/`viewer` tuples.
+- Validation rejects unknown top-level keys, relations named in an
+  implication list but not declared on the type, and cycles in the
+  implication graph (self-implication included).
+- Models are versioned; checks always evaluate against the latest version.
+
+### Check resolution
+
+`Check(client, subject, relation, object, context)` resolves in order:
+
+1. **Deny pass first** — deny tuples match the *exact* relation only (deny
+   never travels through implications) but use full subject expansion
+   (userset hops). Any match denies immediately (deny always wins).
+2. **Allow pass** — the requested relation expands through the model's
+   implications; tuples match the subject directly or via a **userset
+   hop**: a tuple whose subject is `role:R` grants to anyone who has the
+   `member` relation on the object `role:R` (role membership is itself
+   ordinary tuples, so roles can nest).
+3. **Conditions** — a tuple with a `condition_expr` only matches when the
+   expression evaluates true against the request's context map; parse
+   errors and missing context keys fail closed.
+4. **Default deny.** Recursion is depth-limited (20); exceeding the limit
+   denies with an explanatory reason.
+
+`ListObjects(subject, relation, object_type)` returns every object id of a
+type the subject can reach for a relation (reverse expansion over the
+subject index, confirmed by the forward resolver). Conditions are evaluated
+with an empty context, so conditioned allows are excluded.
+
+### Condition expression language
+
+Minimal ABAC grammar over the Check context map (see
+`pkg/authz/condition.go`):
+
+```
+expr       = orExpr
+orExpr     = andExpr { "||" andExpr }
+andExpr    = term { "&&" term }
+term       = "(" expr ")" | comparison
+comparison = operand ("==" | "!=" | "<" | "<=" | ">" | ">=") operand
+operand    = "string" | number | now() | context_key
+```
+
+Examples: `env == "staging"`, `attempts < 3 && env != "prod"`,
+`(tier == "gold" || tier == "silver") && now() < "2027-01-01T00:00:00Z"`.
+Comparisons are numeric when both sides parse as numbers, lexicographic
+strings otherwise; `now()` yields the current UTC time in RFC3339 so it
+compares correctly against RFC3339 `Z` literals. Any parse error or missing
+context key makes the condition false (fail closed).
+
 ## Security Features
 
 - **Password Hashing**: bcrypt with salt (user passwords, client secrets, refresh tokens)

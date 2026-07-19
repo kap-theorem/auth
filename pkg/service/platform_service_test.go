@@ -516,15 +516,34 @@ func TestAuthzModelVersioning(t *testing.T) {
 		t.Fatalf("expected malformed model JSON to be rejected")
 	}
 
+	// Schema violations rejected: unknown relation in an implication list,
+	// and an implication cycle (Phase 3 validation, not just well-formedness)
+	unknownRel, _ := plat.WriteAuthzModel(context.Background(), &authv1.WriteAuthzModelRequest{
+		AccessToken: alice.AccessToken, ClientId: app.App.ClientId,
+		ModelJson: `{"types": {"doc": {"relations": {"viewer": ["editor"]}}}}`,
+	})
+	if unknownRel.Success {
+		t.Fatalf("expected model with unknown implied relation to be rejected")
+	}
+	cyclic, _ := plat.WriteAuthzModel(context.Background(), &authv1.WriteAuthzModelRequest{
+		AccessToken: alice.AccessToken, ClientId: app.App.ClientId,
+		ModelJson: `{"types": {"doc": {"relations": {"a": ["b"], "b": ["a"]}}}}`,
+	})
+	if cyclic.Success {
+		t.Fatalf("expected model with an implication cycle to be rejected")
+	}
+
 	// Versions increment; Get returns the latest
+	modelV1 := `{"types": {"doc": {"relations": {"viewer": []}}}}`
+	modelV2 := `{"types": {"doc": {"relations": {"editor": [], "viewer": ["editor"]}}}}`
 	v1, _ := plat.WriteAuthzModel(context.Background(), &authv1.WriteAuthzModelRequest{
-		AccessToken: alice.AccessToken, ClientId: app.App.ClientId, ModelJson: `{"v":1}`,
+		AccessToken: alice.AccessToken, ClientId: app.App.ClientId, ModelJson: modelV1,
 	})
 	if !v1.Success || v1.Version != 1 {
 		t.Fatalf("expected first model version 1, got %+v", v1)
 	}
 	v2, _ := plat.WriteAuthzModel(context.Background(), &authv1.WriteAuthzModelRequest{
-		AccessToken: alice.AccessToken, ClientId: app.App.ClientId, ModelJson: `{"v":2}`,
+		AccessToken: alice.AccessToken, ClientId: app.App.ClientId, ModelJson: modelV2,
 	})
 	if !v2.Success || v2.Version != 2 {
 		t.Fatalf("expected second model version 2, got %+v", v2)
@@ -532,7 +551,7 @@ func TestAuthzModelVersioning(t *testing.T) {
 	got, _ = plat.GetAuthzModel(context.Background(), &authv1.GetAuthzModelRequest{
 		AccessToken: alice.AccessToken, ClientId: app.App.ClientId,
 	})
-	if !got.Success || got.Version != 2 || got.ModelJson != `{"v":2}` {
+	if !got.Success || got.Version != 2 || got.ModelJson != modelV2 {
 		t.Fatalf("expected latest model v2, got %+v", got)
 	}
 }

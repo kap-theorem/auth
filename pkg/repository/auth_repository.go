@@ -280,13 +280,28 @@ func (r *AuthRepository) ListTuples(ctx context.Context, clientID, objectType, o
 	return tuples, nil
 }
 
-// FindMatchingTuples returns tuples exactly matching an (object, relation,
-// subject) triple with the given effect — the Phase 2 minimal Check lookup.
-func (r *AuthRepository) FindMatchingTuples(ctx context.Context, clientID, objectType, objectID, relation, subjectType, subjectID, effect string) ([]models.RelationTuple, error) {
+// TuplesForObject returns every tuple (any relation, any effect) on one
+// object within a client scope — the resolver's forward lookup
+// (authz.TupleStore).
+func (r *AuthRepository) TuplesForObject(ctx context.Context, clientID, objectType, objectID string) ([]models.RelationTuple, error) {
 	var tuples []models.RelationTuple
 	err := r.db.WithContext(ctx).
-		Where("client_id = ? AND object_type = ? AND object_id = ? AND relation = ? AND subject_type = ? AND subject_id = ? AND effect = ?",
-			clientID, objectType, objectID, relation, subjectType, subjectID, effect).
+		Where("client_id = ? AND object_type = ? AND object_id = ?", clientID, objectType, objectID).
+		Find(&tuples).Error
+	if err != nil {
+		return nil, err
+	}
+	return tuples, nil
+}
+
+// TuplesBySubject returns every tuple within a client scope whose subject
+// matches, restricted to one object type — the resolver's reverse lookup
+// (authz.TupleStore), served by idx_relation_tuples_subject.
+func (r *AuthRepository) TuplesBySubject(ctx context.Context, clientID, subjectType, subjectID, objectType string) ([]models.RelationTuple, error) {
+	var tuples []models.RelationTuple
+	err := r.db.WithContext(ctx).
+		Where("client_id = ? AND subject_type = ? AND subject_id = ? AND object_type = ?",
+			clientID, subjectType, subjectID, objectType).
 		Find(&tuples).Error
 	if err != nil {
 		return nil, err

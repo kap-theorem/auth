@@ -17,6 +17,12 @@ service PlatformService {
   rpc RegisterDeveloper(RegisterDeveloperRequest) returns (RegisterDeveloperResponse);
   // Logs a developer in (platform client) and returns tokens + profile
   rpc DeveloperLogin(DeveloperLoginRequest) returns (DeveloperLoginResponse);
+  // Refreshes a developer session. Server-side this wraps the AuthService
+  // refresh machinery using the platform client's own credentials (the
+  // browser never holds a client secret), with the same rotation and
+  // reuse-revocation semantics: replaying a rotated refresh token revokes
+  // the whole session.
+  rpc DeveloperRefreshToken(DeveloperRefreshTokenRequest) returns (DeveloperRefreshTokenResponse);
 
   // App (client) management — developer token + org ownership required
   // Creates an app under the developer's org; secret is returned once
@@ -30,17 +36,28 @@ service PlatformService {
   // Soft-deletes an app
   rpc DeleteApp(DeleteAppRequest) returns (DeleteAppResponse);
 
-  // Authorization (minimal Phase 2 engine: direct tuple lookup only,
-  // deny wins, default deny; full resolver lands in Phase 3)
+  // Authorization (Phase 3 resolver: deny pass first on the exact relation
+  // — deny never travels through implications — then an allow pass with
+  // model implication expansion and role/userset hops; ABAC conditions
+  // evaluated against the request context, failing closed; recursion
+  // depth-limited at 20; default deny)
   // Evaluates a check in the calling token's client scope
   rpc Check(CheckRequest) returns (CheckResponse);
+  // Lists every object of a type the subject can reach for a relation
+  // (reverse expansion via the subject index, confirmed by the forward
+  // resolver). Conditions are evaluated with an EMPTY context, so
+  // conditioned allow tuples are excluded from the results.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   // Writes (upserts) relation tuples for an app the developer owns
   rpc WriteTuples(WriteTuplesRequest) returns (WriteTuplesResponse);
   // Deletes relation tuples for an app the developer owns
   rpc DeleteTuples(DeleteTuplesRequest) returns (DeleteTuplesResponse);
   // Lists relation tuples for an app the developer owns
   rpc ListTuples(ListTuplesRequest) returns (ListTuplesResponse);
-  // Stores a new version of an app's authz model (validated as JSON)
+  // Stores a new version of an app's authz model, validated against the
+  // schema {"types": {"<type>": {"relations": {"<relation>":
+  // ["<relations that imply it>"]}}}} — unknown relations in implication
+  // lists and implication cycles are rejected
   rpc WriteAuthzModel(WriteAuthzModelRequest) returns (WriteAuthzModelResponse);
   // Returns the latest version of an app's authz model
   rpc GetAuthzModel(GetAuthzModelRequest) returns (GetAuthzModelResponse);
@@ -85,7 +102,7 @@ message Tuple {
   string subject_type = 4; // 'user' | 'role'
   string subject_id = 5;
   string effect = 6;         // 'allow' (default) | 'deny'
-  string condition_expr = 7; // optional ABAC condition (evaluated in Phase 3)
+  string condition_expr = 7; // optional ABAC condition, evaluated against the Check context (fails closed)
 }
 
 message RegisterDeveloperRequest {
@@ -179,7 +196,7 @@ message CheckRequest {
   string relation = 3;
   string object_type = 4;
   string object_id = 5;
-  map<string, string> context = 6; // ABAC context (evaluated in Phase 3)
+  map<string, string> context = 6; // ABAC context for tuple conditions (missing keys fail closed)
   // Tuple scope to evaluate in. Empty defaults to the platform client
   // (used by the console's superadmin gate). Non-platform scopes require
   // the calling developer to own the app (or be a superadmin).
@@ -189,6 +206,36 @@ message CheckRequest {
 message CheckResponse {
   bool allowed = 1;
   string reason = 2;
+}
+
+message ListObjectsRequest {
+  string access_token = 1;
+  // Tuple scope to evaluate in; same rules as CheckRequest.client_id.
+  string client_id = 2;
+  string subject = 3; // "type:id", e.g. "user:1234"
+  string relation = 4;
+  string object_type = 5;
+}
+
+message ListObjectsResponse {
+  bool success = 1;
+  string message = 2;
+  // Object ids (without the type prefix) of object_type that the subject
+  // can reach for the relation, sorted. Conditions are evaluated with an
+  // EMPTY context: conditioned allow tuples are excluded, and every id
+  // returned passes Check with an empty context.
+  repeated string object_ids = 3;
+}
+
+message DeveloperRefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message DeveloperRefreshTokenResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4; // rotated; the presented token is now invalid
 }
 
 message WriteTuplesRequest {

@@ -1,12 +1,12 @@
 package service
 
 import (
+	"authservice/pkg/authz"
 	"authservice/pkg/models"
 	"authservice/pkg/repository"
 	"authservice/pkg/utils"
 	authv1 "authservice/proto/auth/v1"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -35,12 +35,15 @@ const (
 // machinery via the built-in platform client.
 type PlatformServiceServerImpl struct {
 	authv1.UnimplementedPlatformServiceServer
-	repo *repository.AuthRepository
+	repo     *repository.AuthRepository
+	resolver *authz.Resolver
 }
 
 func NewPlatformServiceServer(db *gorm.DB) *PlatformServiceServerImpl {
+	repo := repository.NewAuthRepository(db)
 	return &PlatformServiceServerImpl{
-		repo: repository.NewAuthRepository(db),
+		repo:     repo,
+		resolver: authz.NewResolver(repo),
 	}
 }
 
@@ -182,41 +185,36 @@ func (s *PlatformServiceServerImpl) authenticateDeveloper(ctx context.Context, a
 	return dev, nil
 }
 
-// checkDirect is the Phase 2 minimal Check: exact tuple lookup only, no
-// implications or usersets (those arrive with the Phase 3 resolver).
-// Semantics: deny tuples win; allow requires an unconditioned exact match;
-// anything else is default deny. Conditioned tuples fail closed — a
-// conditioned deny still denies, a conditioned allow does not allow.
-func (s *PlatformServiceServerImpl) checkDirect(ctx context.Context, clientID, subjectType, subjectID, relation, objectType, objectID string) (bool, string, error) {
-	// Deny pass first (deny always wins).
-	denies, err := s.repo.FindMatchingTuples(ctx, clientID, objectType, objectID, relation, subjectType, subjectID, models.EffectDeny)
+// loadModel returns the parsed latest authz model for a client, or nil when
+// no model has been written. A stored model that no longer parses (written
+// before schema validation existed) degrades to nil — exact-relation
+// resolution only, matching the console mock's tolerance.
+func (s *PlatformServiceServerImpl) loadModel(ctx context.Context, clientID string) *authz.Model {
+	stored, err := s.repo.GetLatestAuthzModel(ctx, clientID)
 	if err != nil {
-		return false, "", err
+		return nil // no model written yet
 	}
-	if len(denies) > 0 {
-		return false, "denied by explicit deny tuple", nil
+	model, perr := authz.ParseModel(stored.ModelJSON)
+	if perr != nil {
+		log.Printf("loadModel: stored model v%d for client %s does not parse (ignoring implications): %v", stored.Version, clientID, perr)
+		return nil
 	}
+	return model
+}
 
-	// Allow pass: direct match; conditioned tuples fail closed in Phase 2.
-	allows, err := s.repo.FindMatchingTuples(ctx, clientID, objectType, objectID, relation, subjectType, subjectID, models.EffectAllow)
-	if err != nil {
-		return false, "", err
-	}
-	for _, t := range allows {
-		if strings.TrimSpace(t.ConditionExpr) == "" {
-			return true, "allowed by direct tuple", nil
-		}
-	}
-	if len(allows) > 0 {
-		return false, "matching tuple has a condition (conditions are evaluated in Phase 3; failing closed)", nil
-	}
-	return false, "no matching tuple (default deny)", nil
+// checkResolved runs the full Phase 3 resolver (spec §6) against the
+// client's latest authz model: deny pass first (exact relation), allow pass
+// with implication expansion and role/userset hops, conditions fail closed,
+// depth-limited, default deny.
+func (s *PlatformServiceServerImpl) checkResolved(ctx context.Context, clientID, subjectType, subjectID, relation, objectType, objectID string, condCtx map[string]string) (bool, string, error) {
+	model := s.loadModel(ctx, clientID)
+	return s.resolver.Check(ctx, clientID, model, subjectType, subjectID, relation, objectType, objectID, condCtx)
 }
 
 // isSuperadmin runs the spec §8 check: Check(platform, caller, admin,
 // app:platform).
 func (s *PlatformServiceServerImpl) isSuperadmin(ctx context.Context, developerID string) bool {
-	allowed, _, err := s.checkDirect(ctx, PlatformClientID, tupleSubjectTypeUser, developerID, platformSuperRel, platformObjectType, platformObjectID)
+	allowed, _, err := s.checkResolved(ctx, PlatformClientID, tupleSubjectTypeUser, developerID, platformSuperRel, platformObjectType, platformObjectID, nil)
 	if err != nil {
 		log.Printf("Superadmin check failed for developer %s: %v", developerID, err)
 		return false
@@ -455,6 +453,78 @@ func (s *PlatformServiceServerImpl) DeveloperLogin(ctx context.Context, req *aut
 	}, nil
 }
 
+// DeveloperRefreshToken refreshes a developer session. It wraps the
+// AuthService refresh machinery on the built-in platform client using the
+// service's own authority — the browser never holds a client secret — with
+// the same rotation and reuse-revocation semantics: presenting a rotated
+// (stale) refresh token is a theft signal that revokes the whole session.
+func (s *PlatformServiceServerImpl) DeveloperRefreshToken(ctx context.Context, req *authv1.DeveloperRefreshTokenRequest) (*authv1.DeveloperRefreshTokenResponse, error) {
+	log.Printf("DeveloperRefreshToken request received")
+
+	fail := func(msg string) (*authv1.DeveloperRefreshTokenResponse, error) {
+		return &authv1.DeveloperRefreshTokenResponse{Success: false, Message: msg}, nil
+	}
+
+	if req.RefreshToken == "" {
+		return fail("Refresh token is required")
+	}
+
+	// Parse opaque token: "<session_id>.<secret>"
+	sessionID, secret, ok := utils.ParseRefreshToken(req.RefreshToken)
+	if !ok {
+		return fail("Invalid refresh token")
+	}
+
+	session, err := s.repo.GetSessionByID(ctx, sessionID)
+	if err != nil {
+		log.Printf("DeveloperRefreshToken failed: session not found")
+		return fail("Invalid refresh token")
+	}
+
+	// Only platform-client (developer) sessions may be refreshed here.
+	if session.ClientID != PlatformClientID {
+		log.Printf("DeveloperRefreshToken failed: session %s is not a platform session", session.SessionID)
+		return fail("Invalid refresh token")
+	}
+
+	// A mismatch on an existing session means a rotated (stale) token was
+	// replayed — treat as theft and revoke the whole session.
+	if !utils.VerifyRefreshSecret(secret, session.RefreshTokenHash) {
+		log.Printf("DeveloperRefreshToken: refresh token reuse detected; revoking session %s (user: %s)", session.SessionID, session.UserID)
+		if err := s.repo.DeleteSessionByID(ctx, session.SessionID); err != nil {
+			log.Printf("DeveloperRefreshToken: error revoking session after reuse detection: %v", err)
+		}
+		return fail("Invalid refresh token")
+	}
+
+	// Rotate: new secret, new hash, sliding expiry.
+	newRefreshToken, newHash, err := utils.GenerateRefreshToken(session.SessionID)
+	if err != nil {
+		log.Printf("DeveloperRefreshToken: refresh token generation failed: %v", err)
+		return fail("Internal server error")
+	}
+	session.RefreshTokenHash = newHash
+	session.ExpiresAt = time.Now().Add(refreshTokenLifetime)
+	if err := s.repo.UpdateSession(ctx, session); err != nil {
+		log.Printf("DeveloperRefreshToken: session update failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	accessToken, _, err := utils.GenerateJWTToken(session.UserID, PlatformClientID, session.SessionID)
+	if err != nil {
+		log.Printf("DeveloperRefreshToken: JWT generation failed: %v", err)
+		return fail("Internal server error")
+	}
+
+	log.Printf("Developer token refreshed successfully (session: %s)", session.SessionID)
+	return &authv1.DeveloperRefreshTokenResponse{
+		Success:      true,
+		Message:      "Token refreshed successfully",
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+	}, nil
+}
+
 // ---------------------------------------------------------------------------
 // App management
 // ---------------------------------------------------------------------------
@@ -654,7 +724,7 @@ func (s *PlatformServiceServerImpl) DeleteApp(ctx context.Context, req *authv1.D
 }
 
 // ---------------------------------------------------------------------------
-// Authorization (minimal Phase 2 engine)
+// Authorization (Phase 3 resolver)
 // ---------------------------------------------------------------------------
 
 func (s *PlatformServiceServerImpl) Check(ctx context.Context, req *authv1.CheckRequest) (*authv1.CheckResponse, error) {
@@ -691,12 +761,60 @@ func (s *PlatformServiceServerImpl) Check(ctx context.Context, req *authv1.Check
 		return deny("relation, object_type, and object_id are required")
 	}
 
-	allowed, reason, err := s.checkDirect(ctx, clientID, subjectType, subjectID, req.Relation, req.ObjectType, req.ObjectId)
+	allowed, reason, err := s.checkResolved(ctx, clientID, subjectType, subjectID, req.Relation, req.ObjectType, req.ObjectId, req.Context)
 	if err != nil {
-		log.Printf("Check: tuple lookup failed (client: %s): %v", clientID, err)
+		log.Printf("Check: resolution failed (client: %s): %v", clientID, err)
 		return deny("internal error (failing closed)")
 	}
 	return &authv1.CheckResponse{Allowed: allowed, Reason: reason}, nil
+}
+
+func (s *PlatformServiceServerImpl) ListObjects(ctx context.Context, req *authv1.ListObjectsRequest) (*authv1.ListObjectsResponse, error) {
+	log.Printf("ListObjects request received for client: %s", req.ClientId)
+
+	fail := func(msg string) (*authv1.ListObjectsResponse, error) {
+		return &authv1.ListObjectsResponse{Success: false, Message: msg}, nil
+	}
+
+	dev, err := s.authenticateDeveloper(ctx, req.AccessToken)
+	if err != nil {
+		log.Printf("ListObjects: developer authentication failed: %v", err)
+		return fail("Invalid token")
+	}
+
+	// Same scope rules as Check: empty defaults to the platform client;
+	// per-app scopes require ownership (or superadmin).
+	clientID := req.ClientId
+	if clientID == "" {
+		clientID = PlatformClientID
+	}
+	if clientID != PlatformClientID {
+		if _, err := s.authorizeAppAccess(ctx, dev, clientID); err != nil {
+			log.Printf("ListObjects: ownership check failed for client %s (developer: %s): %v", clientID, dev.DeveloperID, err)
+			return fail("App not found")
+		}
+	}
+
+	subjectType, subjectID, ok := strings.Cut(req.Subject, ":")
+	if !ok || subjectType == "" || subjectID == "" {
+		return fail("subject must be of the form 'type:id'")
+	}
+	if req.Relation == "" || req.ObjectType == "" {
+		return fail("relation and object_type are required")
+	}
+
+	model := s.loadModel(ctx, clientID)
+	objectIDs, err := s.resolver.ListObjects(ctx, clientID, model, subjectType, subjectID, req.ObjectType, req.Relation)
+	if err != nil {
+		log.Printf("ListObjects: resolution failed (client: %s): %v", clientID, err)
+		return fail("Internal server error")
+	}
+
+	return &authv1.ListObjectsResponse{
+		Success:   true,
+		Message:   "Objects retrieved successfully",
+		ObjectIds: objectIDs,
+	}, nil
 }
 
 func (s *PlatformServiceServerImpl) WriteTuples(ctx context.Context, req *authv1.WriteTuplesRequest) (*authv1.WriteTuplesResponse, error) {
@@ -852,10 +970,11 @@ func (s *PlatformServiceServerImpl) WriteAuthzModel(ctx context.Context, req *au
 		return fail("App not found")
 	}
 
-	// Phase 2 only validates well-formedness; the Phase 3 resolver will
-	// validate vocabulary semantics.
-	if !json.Valid([]byte(req.ModelJson)) {
-		return fail("model_json must be well-formed JSON")
+	// Validate against the authz model schema (see pkg/authz/model.go):
+	// unknown relations in implication lists and implication cycles are
+	// rejected, not just malformed JSON.
+	if _, verr := authz.ParseModel(req.ModelJson); verr != nil {
+		return fail(fmt.Sprintf("Invalid authz model: %v", verr))
 	}
 
 	version, err := s.repo.CreateAuthzModelVersion(ctx, client.ClientID, req.ModelJson)
