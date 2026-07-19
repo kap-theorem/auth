@@ -4,11 +4,14 @@
 // In dev, vite proxies /auth.v1 → http://localhost:8081 (see vite.config.ts),
 // so no CORS setup is needed.
 //
-// Token refresh is intentionally NOT implemented: the only refresh RPC in the
-// proto (AuthService.RefreshToken) requires a client_secret, which the console
-// never holds, and the platform contract exposes no developer refresh method.
-// On a 401 / invalid-token style response we clear the session and surface a
-// "session expired, sign in again" ApiError instead.
+// Token refresh: on an expired/invalid-token response the client attempts ONE
+// DeveloperRefreshToken call with the stored refresh token, persists the
+// rotated pair, and retries the original request once. Parallel requests share
+// a single in-flight refresh promise. If the refresh fails, the session is
+// cleared and a "session expired, sign in again" ApiError is surfaced.
+// The client also refreshes proactively ~60s before the access token's exp
+// (JWTs expire in 30 min), via one timer reset on login/refresh and cleared
+// on signOut.
 
 import {
   ApiClient,
@@ -141,8 +144,14 @@ interface StoredSession {
   org: Organization;
 }
 
+/** Internal marker: the backend rejected the current access token. */
+class AuthFailure extends ApiError {}
+
 export class RealApiClient implements ApiClient {
   private stored: StoredSession | null = null;
+  /** Single in-flight refresh, shared by parallel requests. */
+  private refreshing: Promise<boolean> | null = null;
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor() {
     try {
@@ -151,11 +160,30 @@ export class RealApiClient implements ApiClient {
     } catch {
       this.stored = null;
     }
+    if (this.stored) this.scheduleRefresh();
   }
 
   // ---- transport ----
 
   private async post<T>(method: string, body: Record<string, unknown>): Promise<T> {
+    try {
+      return await this.rawPost<T>(method, body);
+    } catch (e) {
+      if (!(e instanceof AuthFailure)) throw e;
+      // Expired/invalid token: try ONE refresh, then retry the request once.
+      if (!(await this.tryRefresh())) this.expire();
+      const retryBody =
+        "accessToken" in body ? { ...body, accessToken: this.token() } : body;
+      try {
+        return await this.rawPost<T>(method, retryBody);
+      } catch (e2) {
+        if (e2 instanceof AuthFailure) this.expire();
+        throw e2;
+      }
+    }
+  }
+
+  private async rawPost<T>(method: string, body: Record<string, unknown>): Promise<T> {
     let res: Response;
     try {
       res = await fetch(`${BASE}/${method}`, {
@@ -166,7 +194,6 @@ export class RealApiClient implements ApiClient {
     } catch {
       throw new ApiError("Cannot reach the backend (is it running on :8081?).");
     }
-    if (res.status === 401 && this.stored) this.expire();
 
     let data: unknown = null;
     try {
@@ -177,12 +204,14 @@ export class RealApiClient implements ApiClient {
     const rec = (data ?? {}) as Record<string, unknown>;
     const message = typeof rec.message === "string" ? rec.message : "";
 
+    if (res.status === 401 && this.stored)
+      throw new AuthFailure(message || "Unauthorized.", 401);
     if (!res.ok) {
-      if (this.looksLikeAuthFailure(message)) this.expire();
+      if (this.looksLikeAuthFailure(message)) throw new AuthFailure(message, res.status);
       throw new ApiError(message || `Request failed (HTTP ${res.status}).`, res.status);
     }
     if (typeof rec.success === "boolean" && !rec.success) {
-      if (this.looksLikeAuthFailure(message)) this.expire();
+      if (this.looksLikeAuthFailure(message)) throw new AuthFailure(message);
       throw new ApiError(message || "Request failed.");
     }
     return rec as T;
@@ -198,9 +227,74 @@ export class RealApiClient implements ApiClient {
   }
 
   private expire(): never {
+    this.clearSession();
+    throw new ApiError("Your session has expired. Please sign in again.", 401);
+  }
+
+  private clearSession(): void {
     this.stored = null;
     sessionStorage.removeItem(SESSION_KEY);
-    throw new ApiError("Your session has expired. Please sign in again.", 401);
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = undefined;
+  }
+
+  // ---- token refresh ----
+
+  /** Refresh the token pair; parallel callers await the same attempt. */
+  private tryRefresh(): Promise<boolean> {
+    if (!this.refreshing) {
+      this.refreshing = this.doRefresh().finally(() => {
+        this.refreshing = null;
+      });
+    }
+    return this.refreshing;
+  }
+
+  private async doRefresh(): Promise<boolean> {
+    const refreshToken = this.stored?.refreshToken;
+    if (!refreshToken) return false;
+    try {
+      const r = await this.rawPost<{ accessToken?: string; refreshToken?: string }>(
+        "DeveloperRefreshToken",
+        { refreshToken }
+      );
+      if (!r.accessToken || !r.refreshToken || !this.stored) return false;
+      // Rotation: the returned refresh token replaces the old one.
+      this.stored = {
+        ...this.stored,
+        accessToken: r.accessToken,
+        refreshToken: r.refreshToken,
+      };
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(this.stored));
+      this.scheduleRefresh();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** exp claim (seconds) from a JWT's base64url payload, or null. */
+  private decodeExp(token: string): number | null {
+    try {
+      const payload = token.split(".")[1];
+      const json = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as {
+        exp?: unknown;
+      };
+      return typeof json.exp === "number" ? json.exp : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** One timer that refreshes ~60s before the access token expires. */
+  private scheduleRefresh(): void {
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = undefined;
+    if (!this.stored?.refreshToken) return;
+    const exp = this.decodeExp(this.stored.accessToken);
+    if (exp === null) return;
+    const delayMs = Math.max(exp * 1000 - Date.now() - 60_000, 5_000);
+    this.refreshTimer = setTimeout(() => void this.tryRefresh(), delayMs);
   }
 
   private token(): string {
@@ -226,6 +320,7 @@ export class RealApiClient implements ApiClient {
     };
     this.stored = { accessToken: r.accessToken, refreshToken: r.refreshToken, developer, org };
     sessionStorage.setItem(SESSION_KEY, JSON.stringify(this.stored));
+    this.scheduleRefresh();
     return { token: r.accessToken, developer, org };
   }
 
@@ -236,8 +331,7 @@ export class RealApiClient implements ApiClient {
   }
 
   signOut(): void {
-    this.stored = null;
-    sessionStorage.removeItem(SESSION_KEY);
+    this.clearSession();
   }
 
   restoreSession(): DeveloperSession | null {

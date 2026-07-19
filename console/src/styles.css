@@ -333,7 +333,7 @@ table.data tr.rowlink:hover td { background: var(--surface-dim); }
 .verdict .word { font-size: 22px; font-weight: 700; letter-spacing: 0.06em; }
 .verdict.allowed { background: var(--allow-bg); border-color: var(--allow-line); color: var(--allow); }
 .verdict.denied { background: var(--deny-bg); border-color: var(--deny-line); color: var(--deny); }
-.verdict .reason { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
+.verdict .reason { font-size: 13px; margin-top: 6px; color: var(--ink-2); font-family: var(--mono, ui-monospace, monospace); }
 
 /* ---------- stat tiles (metrics) ---------- */
 

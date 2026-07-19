@@ -58,7 +58,7 @@ export interface DeveloperSession {
 
 export interface CheckResult {
   allowed: boolean;
-  /** Debug hint from the resolver (mock-only convenience; never a security signal). */
+  /** Debug hint from the resolver (shown under the Check verdict; never a security signal). */
   reason?: string;
 }
 

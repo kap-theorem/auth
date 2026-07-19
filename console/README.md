@@ -33,10 +33,18 @@ The vite dev server proxies `/auth.v1` → `http://localhost:8081`
 - HTTP POST to `/auth.v1.PlatformService/{MethodName}` with JSON bodies in
   protojson style (camelCase fields).
 - Requests carry `accessToken` in the body; the token (+ refresh token) is
-  kept in sessionStorage. There is no developer token refresh RPC in the
-  contract (AuthService `RefreshToken` needs a client secret the console
-  never holds), so on a 401 / invalid-token response the client clears the
-  session and surfaces "session expired, sign in again".
+  kept in sessionStorage.
+- **Token refresh**: on a 401 / invalid-token response the client calls
+  `DeveloperRefreshToken` once with the stored refresh token
+  (`{refreshToken}` → `{success, message, accessToken, refreshToken}`),
+  persists the rotated pair (the returned refresh token replaces the old
+  one; replaying an old one revokes the session), and retries the original
+  request once. Parallel requests share a single in-flight refresh. If the
+  refresh fails, the session is cleared and "session expired, sign in
+  again" is surfaced. The client also refreshes **proactively** ~60s before
+  the access token's `exp` (JWTs expire in 30 min) via one timer, decoded
+  from the token's base64url payload — reset on login/refresh, cleared on
+  sign-out.
 - Methods: RegisterDeveloper (then an automatic DeveloperLogin, since
   registration returns ids only), DeveloperLogin, CreateApp / ListApps /
   UpdateApp / RotateAppSecret / DeleteApp, WriteAuthzModel / GetAuthzModel,
@@ -70,7 +78,14 @@ The developer account owns two seeded apps — try the **dsapanicle** app: it ha
 a seeded authz model (`author → editor → viewer` implications), tuples with a
 role userset (`role:moderator`), an explicit deny (`user:banned`), and a
 conditional tuple (`user:contractor` viewer on `problem:binary-search` only
-when context `{"env": "staging"}`). The Check tester exercises all of them.
+when context `{"env": "staging"}`). The Check tester exercises all of them,
+and shows the resolver's `reason` string under the ALLOWED/DENIED verdict.
+
+Condition grammar (tuple `condition_expr`): comparisons `==`, `!=`, `<`, `>`,
+joined with `&&` / `||`; `now()`, context keys as identifiers, string literals
+in double quotes — e.g. `env == "staging" && now() < "2026-08-01T00:00:00Z"`.
+(The in-memory mock evaluates only the `key == "value"` / `key != "value"`
+`&&` subset and fails closed on the rest.)
 
 ## What's mocked
 

@@ -451,6 +451,13 @@ function TuplesTab({ clientId }: { clientId: string }) {
             value={draft.condition_expr}
             onChange={(e) => setDraft({ ...draft, condition_expr: e.target.value })}
           />
+          <span className="hint">
+            Grammar: comparisons <code>==</code> <code>!=</code> <code>&lt;</code>{" "}
+            <code>&gt;</code>, joined with <code>&amp;&amp;</code> / <code>||</code>;{" "}
+            <code>now()</code>, context keys as identifiers, string literals in double
+            quotes — e.g. <code>env == "staging" &amp;&amp; now() &lt;
+            "2026-08-01T00:00:00Z"</code>
+          </span>
         </label>
         {error && <p className="error-text">{error}</p>}
         <button className="btn" disabled={busy}>
