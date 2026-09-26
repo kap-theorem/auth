@@ -17,6 +17,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const refreshTokenLifetime = 7 * 24 * time.Hour // 7 days, sliding
+
 type AuthServiceServerImpl struct {
 	authv1.UnimplementedAuthServiceServer
 	repo *repository.AuthRepository
@@ -26,6 +28,161 @@ func NewAuthServiceServer(db *gorm.DB) *AuthServiceServerImpl {
 	return &AuthServiceServerImpl{
 		repo: repository.NewAuthRepository(db),
 	}
+}
+
+// authenticateClient verifies client_id + client_secret against the stored
+// bcrypt hash. bcrypt comparison is constant-time. Every RPC (except
+// HealthCheck and the ADMIN_SECRET-gated client management RPCs) must call
+// this first. Suspended clients fail all RPC authentication.
+func (s *AuthServiceServerImpl) authenticateClient(ctx context.Context, clientID, clientSecret string) (*models.Client, error) {
+	return authenticateClientCreds(ctx, s.repo, clientID, clientSecret)
+}
+
+// authenticateClientCreds is the shared client-credential check, also used
+// by PlatformService's machine RPC paths (Check/ListTuples with client
+// credentials instead of a developer token).
+func authenticateClientCreds(ctx context.Context, repo *repository.AuthRepository, clientID, clientSecret string) (*models.Client, error) {
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("missing client credentials")
+	}
+	client, err := repo.GetClientByID(ctx, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("client lookup failed: %w", err)
+	}
+	if !utils.CheckPasswordHash(clientSecret, client.ClientSecretHash) {
+		return nil, fmt.Errorf("client secret mismatch")
+	}
+	if client.Suspended {
+		return nil, fmt.Errorf("client is suspended")
+	}
+	return client, nil
+}
+
+// userScope resolves the identity scope a client's users live in:
+// app-scoped clients own their user base; org-scoped clients share their
+// org's user pool (SSO).
+func userScope(client *models.Client) (scopeType, scopeID string) {
+	if client.IdentityScope == models.ScopeOrg {
+		return models.ScopeOrg, client.OrgID
+	}
+	return models.ScopeApp, client.ClientID
+}
+
+// authenticateUserToken validates an access token for a client and returns
+// the claims plus the live session row. Fails if the session has been
+// revoked (revocation-aware validation).
+func (s *AuthServiceServerImpl) authenticateUserToken(ctx context.Context, accessToken, clientID string) (*utils.Claims, *models.Session, error) {
+	return validateUserSessionToken(ctx, s.repo, accessToken, clientID)
+}
+
+// validateUserSessionToken is the shared end-user token check, also used by
+// PlatformService's hosted account RPCs (where the browser holds only the
+// user's token, never a client secret): JWT signature/expiry, token
+// client_id == expected client_id, and a live (unrevoked) session matching
+// the claims.
+func validateUserSessionToken(ctx context.Context, repo *repository.AuthRepository, accessToken, clientID string) (*utils.Claims, *models.Session, error) {
+	claims, err := utils.ValidateJWTToken(accessToken)
+	if err != nil {
+		return nil, nil, fmt.Errorf("token validation failed: %w", err)
+	}
+	if claims.ClientID != clientID {
+		return nil, nil, fmt.Errorf("token client mismatch")
+	}
+	session, err := repo.GetSessionByID(ctx, claims.SessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session lookup failed: %w", err)
+	}
+	if session.UserID != claims.Subject || session.ClientID != claims.ClientID {
+		return nil, nil, fmt.Errorf("session does not match token claims")
+	}
+	return claims, session, nil
+}
+
+// listUserSessionInfos returns a user's active sessions under a client as
+// proto SessionInfo rows, marking currentSessionID. Shared by
+// AuthService.GetUserSessions and PlatformService.HostedGetProfile.
+func listUserSessionInfos(ctx context.Context, repo *repository.AuthRepository, userID, clientID, currentSessionID string) ([]*authv1.SessionInfo, error) {
+	sessions, err := repo.GetSessionsByUserAndClient(ctx, userID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]*authv1.SessionInfo, 0, len(sessions))
+	for _, sess := range sessions {
+		infos = append(infos, &authv1.SessionInfo{
+			SessionId: sess.SessionID,
+			UserAgent: sess.UserAgent,
+			CreatedAt: timestamppb.New(sess.CreatedAt),
+			ExpiresAt: timestamppb.New(sess.ExpiresAt),
+			Current:   sess.SessionID == currentSessionID,
+		})
+	}
+	return infos, nil
+}
+
+// changeUserPassword is the shared password-change core (AuthService.
+// ChangeUserPassword and PlatformService.HostedChangePassword): verifies the
+// current password, applies the >=8 chars policy, stores a bcrypt hash, and
+// invalidates all OTHER sessions — the caller's session stays alive. Returns
+// (success, user-facing message).
+func changeUserPassword(ctx context.Context, repo *repository.AuthRepository, userID, keepSessionID, currentPassword, newPassword string) (bool, string) {
+	if currentPassword == "" || newPassword == "" {
+		return false, "Current password and new password are required"
+	}
+	// Same policy as registration
+	if len(newPassword) < 8 {
+		return false, "Password must be at least 8 characters long"
+	}
+
+	user, err := repo.GetUserByID(ctx, userID)
+	if err != nil {
+		log.Printf("changeUserPassword: error getting user by ID: %v", err)
+		return false, "Invalid access token"
+	}
+
+	if !utils.CheckPasswordHash(currentPassword, user.Password) {
+		return false, "Current password is incorrect"
+	}
+
+	hashedNewPassword, err := utils.HashPassword(newPassword)
+	if err != nil {
+		log.Printf("changeUserPassword: error hashing new password: %v", err)
+		return false, "Internal server error"
+	}
+
+	user.Password = hashedNewPassword
+	if err := repo.UpdateUser(ctx, user); err != nil {
+		log.Printf("changeUserPassword: error updating user password: %v", err)
+		return false, "Internal server error"
+	}
+
+	// Invalidate all OTHER sessions; the current session stays alive
+	if err := repo.DeleteOtherUserSessions(ctx, user.UserID, keepSessionID); err != nil {
+		log.Printf("changeUserPassword: error invalidating other user sessions: %v", err)
+		return false, "Password changed but failed to invalidate other sessions"
+	}
+
+	log.Printf("Password changed successfully for user: %s", user.UserID)
+	return true, "Password changed successfully. Other sessions have been logged out."
+}
+
+// revokeOwnUserSession deletes one of the token owner's own sessions under a
+// client. Sessions belonging to another user or client are reported as "not
+// found" (no existence oracle). Shared by AuthService.RevokeSession and
+// PlatformService.HostedRevokeSession.
+func revokeOwnUserSession(ctx context.Context, repo *repository.AuthRepository, userID, clientID, sessionID string) (bool, string) {
+	if sessionID == "" {
+		return false, "Session ID is required"
+	}
+	target, err := repo.GetSessionByID(ctx, sessionID)
+	if err != nil || target.UserID != userID || target.ClientID != clientID {
+		return false, "Session not found"
+	}
+	if err := repo.DeleteSessionByID(ctx, target.SessionID); err != nil {
+		log.Printf("revokeOwnUserSession: error deleting session %s: %v", target.SessionID, err)
+		return false, "Internal server error"
+	}
+	log.Printf("Session revoked: %s (user: %s, client: %s)", target.SessionID, userID, clientID)
+	return true, "Session revoked successfully"
 }
 
 func (s *AuthServiceServerImpl) HealthCheck(ctx context.Context, in *emptypb.Empty) (*authv1.HealthCheckResponse, error) {
@@ -40,7 +197,7 @@ func (s *AuthServiceServerImpl) HealthCheck(ctx context.Context, in *emptypb.Emp
 }
 
 func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.RegisterUserRequest) (*authv1.RegisterUserResponse, error) {
-	log.Printf("RegisterUser request received for email: %s", req.Email)
+	log.Printf("RegisterUser request received for client: %s", req.ClientId)
 
 	// Validation
 	if err := s.validateUserRegistration(req); err != nil {
@@ -50,67 +207,21 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 		}, nil
 	}
 
-	// Check if client exists
-	clientExists, err := s.repo.IsClientExists(ctx, req.ClientId)
+	// Authenticate client
+	client, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret)
 	if err != nil {
-		log.Printf("Error checking client existence: %v", err)
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.RegisterUserResponse{
 			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-	if !clientExists {
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Invalid client ID",
+			Message: "Invalid client credentials",
 		}, nil
 	}
 
-	// Check if email already exists
-	emailExists, err := s.repo.IsEmailExists(ctx, req.Email)
-	if err != nil {
-		log.Printf("Error checking email existence: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
+	userID, msg, ok := createEndUser(ctx, s.repo, client, req.Username, req.Email, req.Password)
+	if !ok {
+		return &authv1.RegisterUserResponse{Success: false, Message: msg}, nil
 	}
-	if emailExists {
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Email already registered",
-		}, nil
-	}
-
-	// Hash password
-	hashedPassword, err := utils.HashPassword(req.Password)
-	if err != nil {
-		log.Printf("Error hashing password: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Create user
-	userID := utils.GenerateUUID()
-	user := &models.User{
-		UserID:   userID,
-		UserName: req.Username,
-		Email:    req.Email,
-		Password: hashedPassword,
-		ClientID: req.ClientId,
-	}
-
-	if err := s.repo.CreateUser(ctx, user); err != nil {
-		log.Printf("Error creating user: %v", err)
-		return &authv1.RegisterUserResponse{
-			Success: false,
-			Message: "Failed to create user",
-		}, nil
-	}
-
-	log.Printf("User registered successfully: %s", userID)
+	log.Printf("User registered successfully: %s (client: %s)", userID, req.ClientId)
 	return &authv1.RegisterUserResponse{
 		Success: true,
 		Message: "User registered successfully",
@@ -118,61 +229,144 @@ func (s *AuthServiceServerImpl) RegisterUser(ctx context.Context, req *authv1.Re
 	}, nil
 }
 
+// createEndUser creates an end user within the client's identity scope,
+// enforcing per-scope email AND username uniqueness. Shared by RegisterUser
+// (client-secret) and HostedRegister (public signup). Returns (userID,
+// message, ok); on ok==false the message is a user-safe reason.
+func createEndUser(ctx context.Context, repo *repository.AuthRepository, client *models.Client, username, email, password string) (string, string, bool) {
+	scopeType, scopeID := userScope(client)
+
+	emailExists, err := repo.IsEmailExists(ctx, email, scopeType, scopeID)
+	if err != nil {
+		log.Printf("Error checking email existence: %v", err)
+		return "", "Internal server error", false
+	}
+	if emailExists {
+		return "", "Email already registered", false
+	}
+
+	usernameExists, err := repo.IsUsernameExists(ctx, username, scopeType, scopeID, "")
+	if err != nil {
+		log.Printf("Error checking username existence: %v", err)
+		return "", "Internal server error", false
+	}
+	if usernameExists {
+		return "", "Username already taken", false
+	}
+
+	hashedPassword, err := utils.HashPassword(password)
+	if err != nil {
+		log.Printf("Error hashing password: %v", err)
+		return "", "Internal server error", false
+	}
+
+	userID := utils.GenerateUUID()
+	user := &models.User{
+		UserID:    userID,
+		UserName:  username,
+		Email:     email,
+		Password:  hashedPassword,
+		ScopeType: scopeType,
+		ScopeID:   scopeID,
+	}
+	if err := repo.CreateUser(ctx, user); err != nil {
+		log.Printf("Error creating user: %v", err)
+		return "", "Failed to create user", false
+	}
+	return userID, "", true
+}
+
 func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTokenRequest) (*authv1.GetTokenResponse, error) {
-	log.Printf("GetToken request received for email: %s", req.Email)
+	log.Printf("GetToken request received for client: %s", req.ClientId)
 
 	// Validation
-	if req.Email == "" || req.Password == "" || req.ClientId == "" {
+	if req.Email == "" || req.Password == "" || req.ClientId == "" || req.ClientSecret == "" {
 		return &authv1.GetTokenResponse{
 			Success: false,
-			Message: "Email, password, and client ID are required",
+			Message: "Email, password, client ID, and client secret are required",
 		}, nil
 	}
 
-	// Check if client exists
-	clientExists, err := s.repo.IsClientExists(ctx, req.ClientId)
+	// Authenticate client
+	client, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret)
 	if err != nil {
-		log.Printf("Error checking client existence: %v", err)
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
 		return &authv1.GetTokenResponse{
 			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-	if !clientExists {
-		return &authv1.GetTokenResponse{
-			Success: false,
-			Message: "Invalid client ID",
+			Message: "Invalid client credentials",
 		}, nil
 	}
 
-	// Get user by email
-	user, err := s.repo.GetUserByEmail(ctx, req.Email)
+	return issueLoginTokens(ctx, s.repo, client, req.Email, req.Password, req.UserAgent)
+}
+
+// issueLoginTokens is the shared end-user login machinery used by GetToken
+// and PlatformService.HostedLogin: resolves the user within the client's
+// identity scope, verifies the password, creates a session (multi-session:
+// one row per login/device), and returns the token pair + profile. The
+// caller must already have established trust in the client (client secret
+// for GetToken; the redirect_uri whitelist for HostedLogin).
+// resolveLoginUser looks up the login user by the app's login-identifier mode.
+// 'email_only'    -> identifier is an email.
+// 'username_only' -> identifier is a username.
+// 'username_or_email' (default) -> an "@" picks email, otherwise username.
+func resolveLoginUser(ctx context.Context, repo *repository.AuthRepository, client *models.Client, identifier string) (*models.User, error) {
+	scopeType, scopeID := userScope(client)
+	switch client.LoginIdentifier {
+	case "email_only":
+		return repo.GetUserByEmail(ctx, identifier, scopeType, scopeID)
+	case "username_only":
+		return repo.GetUserByUsername(ctx, identifier, scopeType, scopeID)
+	default: // username_or_email
+		if strings.Contains(identifier, "@") {
+			return repo.GetUserByEmail(ctx, identifier, scopeType, scopeID)
+		}
+		return repo.GetUserByUsername(ctx, identifier, scopeType, scopeID)
+	}
+}
+
+func issueLoginTokens(ctx context.Context, repo *repository.AuthRepository, client *models.Client, identifier, password, userAgent string) (*authv1.GetTokenResponse, error) {
+	// Resolve the user within the client's identity scope (app-scoped
+	// clients have their own users; org-scoped clients share the org pool),
+	// honoring the app's login-identifier mode (username / email / either).
+	user, err := resolveLoginUser(ctx, repo, client, identifier)
 	if err != nil {
-		log.Printf("Error getting user by email: %v", err)
+		log.Printf("Login failed for client %s: user lookup error", client.ClientID)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
 		}, nil
 	}
+	return finishLogin(ctx, repo, client, user, password, userAgent)
+}
 
-	// Check if user belongs to the client
-	if user.ClientID != req.ClientId {
-		return &authv1.GetTokenResponse{
-			Success: false,
-			Message: "Invalid credentials",
-		}, nil
-	}
-
+// finishLogin verifies the password, rejects deactivated users, creates a
+// session, and returns the token pair + profile. Shared by the identifier
+// login path (issueLoginTokens) and demo login (which resolves the user by
+// email directly, bypassing the login-identifier mode).
+func finishLogin(ctx context.Context, repo *repository.AuthRepository, client *models.Client, user *models.User, password, userAgent string) (*authv1.GetTokenResponse, error) {
 	// Verify password
-	if !utils.CheckPasswordHash(req.Password, user.Password) {
+	if !utils.CheckPasswordHash(password, user.Password) {
+		log.Printf("Login failed for user %s (client: %s)", user.UserID, client.ClientID)
 		return &authv1.GetTokenResponse{
 			Success: false,
 			Message: "Invalid credentials",
 		}, nil
 	}
 
-	// Generate refresh token
-	refreshToken, err := utils.GenerateRefreshToken()
+	// Deactivated users are rejected with the same generic message —
+	// deactivation is never distinguishable from bad credentials.
+	if !user.Active {
+		log.Printf("Login rejected for deactivated user %s (client: %s)", user.UserID, client.ClientID)
+		return &authv1.GetTokenResponse{
+			Success: false,
+			Message: "Invalid credentials",
+		}, nil
+	}
+
+	// Create a new session (multi-session: one row per login/device)
+	sessionID := utils.GenerateUUID()
+	refreshToken, refreshHash, err := utils.GenerateRefreshToken(sessionID)
 	if err != nil {
 		log.Printf("Error generating refresh token: %v", err)
 		return &authv1.GetTokenResponse{
@@ -181,8 +375,25 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
-	// Generate JWT token with refresh token in payload
-	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, refreshToken)
+	session := &models.Session{
+		SessionID:        sessionID,
+		UserID:           user.UserID,
+		ClientID:         client.ClientID,
+		RefreshTokenHash: refreshHash,
+		UserAgent:        userAgent,
+		ExpiresAt:        time.Now().Add(refreshTokenLifetime),
+	}
+
+	if err := repo.CreateSession(ctx, session); err != nil {
+		log.Printf("Error creating session: %v", err)
+		return &authv1.GetTokenResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	// Generate JWT access token (sub, client_id, session_id)
+	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, client.ClientID, sessionID)
 	if err != nil {
 		log.Printf("Error generating JWT token: %v", err)
 		return &authv1.GetTokenResponse{
@@ -191,32 +402,15 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		}, nil
 	}
 
-	// Create or update session (only one session per user-client pair)
-	session := &models.Session{
-		UserID:       user.UserID,
-		ClientID:     user.ClientID,
-		RefreshToken: refreshToken,
-		UserAgent:    req.UserAgent,
-		ExpiresAt:    time.Now().Add(7 * 24 * time.Hour), // 7 days
-	}
-
-	if err := s.repo.CreateOrUpdateSession(ctx, session); err != nil {
-		log.Printf("Error creating/updating session: %v", err)
-		return &authv1.GetTokenResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
 	userProfile := &authv1.UserProfile{
 		UserId:    user.UserID,
 		Username:  user.UserName,
 		Email:     user.Email,
-		ClientId:  user.ClientID,
+		ClientId:  client.ClientID,
 		CreatedAt: timestamppb.New(user.CreatedAt),
 	}
 
-	log.Printf("User logged in successfully: %s", user.UserID)
+	log.Printf("User logged in successfully: %s (session: %s)", user.UserID, sessionID)
 	return &authv1.GetTokenResponse{
 		Success:      true,
 		Message:      "Login successful",
@@ -224,11 +418,12 @@ func (s *AuthServiceServerImpl) GetToken(ctx context.Context, req *authv1.GetTok
 		RefreshToken: refreshToken,
 		ExpiresAt:    timestamppb.New(expiresAt),
 		User:         userProfile,
+		SessionId:    sessionID,
 	}, nil
 }
 
 func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.ValidateTokenRequest) (*authv1.ValidateTokenResponse, error) {
-	log.Printf("ValidateToken request received")
+	log.Printf("ValidateToken request received for client: %s", req.ClientId)
 
 	if req.AccessToken == "" {
 		return &authv1.ValidateTokenResponse{
@@ -237,50 +432,40 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		}, nil
 	}
 
-	claims, err := utils.ValidateJWTToken(req.AccessToken)
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.ValidateTokenResponse{
+			Valid:   false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	// Validate token + revocation check (session row must exist)
+	claims, session, err := s.authenticateUserToken(ctx, req.AccessToken, req.ClientId)
 	if err != nil {
-		log.Printf("Error validating JWT token: %v", err)
+		log.Printf("Token validation failed for client %s: %v", req.ClientId, err)
 		return &authv1.ValidateTokenResponse{
 			Valid:   false,
 			Message: "Invalid token",
 		}, nil
 	}
 
-	// Check if user still exists
-	user, err := s.repo.GetUserByID(ctx, claims.UserID)
+	// Check the user still exists and is active (deactivation invalidates
+	// outstanding tokens even if a session row were to survive)
+	user, err := s.repo.GetUserByID(ctx, claims.Subject)
 	if err != nil {
 		log.Printf("Error getting user by ID: %v", err)
 		return &authv1.ValidateTokenResponse{
 			Valid:   false,
-			Message: "User not found",
+			Message: "Invalid token",
 		}, nil
 	}
-
-	// Validate username matches
-	if user.UserName != claims.Username {
-		log.Printf("Username mismatch in token claims")
+	if !user.Active {
+		log.Printf("Token rejected for deactivated user %s (client: %s)", user.UserID, req.ClientId)
 		return &authv1.ValidateTokenResponse{
 			Valid:   false,
-			Message: "Invalid token claims",
-		}, nil
-	}
-
-	// Validate client ID matches
-	if user.ClientID != claims.ClientID {
-		log.Printf("Client ID mismatch in token claims")
-		return &authv1.ValidateTokenResponse{
-			Valid:   false,
-			Message: "Invalid token claims",
-		}, nil
-	}
-
-	// Validate refresh token exists in database (for additional security)
-	session, err := s.repo.GetSessionByUserAndClient(ctx, user.UserID, user.ClientID)
-	if err != nil || session.RefreshToken != claims.RefreshToken {
-		log.Printf("Refresh token validation failed")
-		return &authv1.ValidateTokenResponse{
-			Valid:   false,
-			Message: "Invalid session",
+			Message: "Invalid token",
 		}, nil
 	}
 
@@ -288,7 +473,7 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		UserId:    user.UserID,
 		Username:  user.UserName,
 		Email:     user.Email,
-		ClientId:  user.ClientID,
+		ClientId:  claims.ClientID,
 		CreatedAt: timestamppb.New(user.CreatedAt),
 	}
 
@@ -298,49 +483,72 @@ func (s *AuthServiceServerImpl) ValidateToken(ctx context.Context, req *authv1.V
 		UserId:    user.UserID,
 		ExpiresAt: timestamppb.New(claims.ExpiresAt.Time),
 		User:      userProfile,
+		SessionId: session.SessionID,
 	}, nil
 }
 
 func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.RefreshTokenRequest) (*authv1.RefreshTokenResponse, error) {
-	log.Printf("RefreshToken request received")
+	log.Printf("RefreshToken request received for client: %s", req.ClientId)
 
-	if req.RefreshToken == "" || req.ClientId == "" {
+	if req.RefreshToken == "" || req.ClientId == "" || req.ClientSecret == "" {
 		return &authv1.RefreshTokenResponse{
 			Success: false,
-			Message: "Refresh token and client ID are required",
+			Message: "Refresh token, client ID, and client secret are required",
 		}, nil
 	}
 
-	// Get session by refresh token
-	session, err := s.repo.GetSessionByRefreshToken(ctx, req.RefreshToken)
-	if err != nil {
-		log.Printf("Error getting session by refresh token: %v", err)
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.RefreshTokenResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	// Parse opaque token: "<session_id>.<secret>"
+	sessionID, secret, ok := utils.ParseRefreshToken(req.RefreshToken)
+	if !ok {
 		return &authv1.RefreshTokenResponse{
 			Success: false,
 			Message: "Invalid refresh token",
 		}, nil
 	}
 
-	// Get user
-	user, err := s.repo.GetUserByID(ctx, session.UserID)
+	session, err := s.repo.GetSessionByID(ctx, sessionID)
 	if err != nil {
-		log.Printf("Error getting user by ID: %v", err)
+		log.Printf("Refresh failed for client %s: session not found", req.ClientId)
 		return &authv1.RefreshTokenResponse{
 			Success: false,
-			Message: "User not found",
+			Message: "Invalid refresh token",
 		}, nil
 	}
 
-	// Check if user belongs to the client
-	if user.ClientID != req.ClientId {
+	// Cross-tenant guard: session must belong to the calling client
+	if session.ClientID != req.ClientId {
+		log.Printf("Refresh failed: session client mismatch (client: %s)", req.ClientId)
 		return &authv1.RefreshTokenResponse{
 			Success: false,
-			Message: "Invalid client ID",
+			Message: "Invalid refresh token",
 		}, nil
 	}
 
-	// Generate new tokens
-	newRefreshToken, err := utils.GenerateRefreshToken()
+	// Verify the secret against the stored bcrypt hash. A mismatch on an
+	// existing session means a rotated (stale) token was replayed — treat
+	// as theft and revoke the whole session.
+	if !utils.VerifyRefreshSecret(secret, session.RefreshTokenHash) {
+		log.Printf("Refresh token reuse detected; revoking session %s (user: %s, client: %s)", session.SessionID, session.UserID, session.ClientID)
+		if err := s.repo.DeleteSessionByID(ctx, session.SessionID); err != nil {
+			log.Printf("Error revoking session after reuse detection: %v", err)
+		}
+		return &authv1.RefreshTokenResponse{
+			Success: false,
+			Message: "Invalid refresh token",
+		}, nil
+	}
+
+	// Rotate: new secret, new hash, sliding expiry
+	newRefreshToken, newHash, err := utils.GenerateRefreshToken(session.SessionID)
 	if err != nil {
 		log.Printf("Error generating refresh token: %v", err)
 		return &authv1.RefreshTokenResponse{
@@ -349,8 +557,17 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 		}, nil
 	}
 
-	// Generate JWT token with new refresh token in payload
-	accessToken, expiresAt, err := utils.GenerateJWTToken(user.UserID, user.UserName, user.ClientID, newRefreshToken)
+	session.RefreshTokenHash = newHash
+	session.ExpiresAt = time.Now().Add(refreshTokenLifetime)
+	if err := s.repo.UpdateSession(ctx, session); err != nil {
+		log.Printf("Error updating session: %v", err)
+		return &authv1.RefreshTokenResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	accessToken, expiresAt, err := utils.GenerateJWTToken(session.UserID, session.ClientID, session.SessionID)
 	if err != nil {
 		log.Printf("Error generating JWT token: %v", err)
 		return &authv1.RefreshTokenResponse{
@@ -359,18 +576,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 		}, nil
 	}
 
-	// Update session with new refresh token
-	session.RefreshToken = newRefreshToken
-	session.ExpiresAt = time.Now().Add(7 * 24 * time.Hour) // 7 days
-	if err := s.repo.CreateOrUpdateSession(ctx, session); err != nil {
-		log.Printf("Error updating session: %v", err)
-		return &authv1.RefreshTokenResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	log.Printf("Token refreshed successfully for user: %s", user.UserID)
+	log.Printf("Token refreshed successfully for user: %s (session: %s)", session.UserID, session.SessionID)
 	return &authv1.RefreshTokenResponse{
 		Success:      true,
 		Message:      "Token refreshed successfully",
@@ -381,7 +587,7 @@ func (s *AuthServiceServerImpl) RefreshToken(ctx context.Context, req *authv1.Re
 }
 
 func (s *AuthServiceServerImpl) RevokeToken(ctx context.Context, req *authv1.RevokeTokenRequest) (*authv1.RevokeTokenResponse, error) {
-	log.Printf("RevokeToken request received")
+	log.Printf("RevokeToken request received for client: %s", req.ClientId)
 
 	if req.RefreshToken == "" {
 		return &authv1.RevokeTokenResponse{
@@ -390,24 +596,174 @@ func (s *AuthServiceServerImpl) RevokeToken(ctx context.Context, req *authv1.Rev
 		}, nil
 	}
 
-	// Delete session by refresh token
-	if err := s.repo.DeleteSessionByRefreshToken(ctx, req.RefreshToken); err != nil {
-		log.Printf("Error deleting session: %v", err)
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.RevokeTokenResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	sessionID, secret, ok := utils.ParseRefreshToken(req.RefreshToken)
+	if !ok {
 		return &authv1.RevokeTokenResponse{
 			Success: false,
 			Message: "Invalid refresh token",
 		}, nil
 	}
 
-	log.Printf("Token revoked successfully")
+	session, err := s.repo.GetSessionByID(ctx, sessionID)
+	if err != nil {
+		return &authv1.RevokeTokenResponse{
+			Success: false,
+			Message: "Invalid refresh token",
+		}, nil
+	}
+
+	if session.ClientID != req.ClientId || !utils.VerifyRefreshSecret(secret, session.RefreshTokenHash) {
+		return &authv1.RevokeTokenResponse{
+			Success: false,
+			Message: "Invalid refresh token",
+		}, nil
+	}
+
+	if err := s.repo.DeleteSessionByID(ctx, session.SessionID); err != nil {
+		log.Printf("Error deleting session: %v", err)
+		return &authv1.RevokeTokenResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	log.Printf("Session revoked successfully: %s (user: %s)", session.SessionID, session.UserID)
 	return &authv1.RevokeTokenResponse{
 		Success: true,
 		Message: "Token revoked successfully",
 	}, nil
 }
 
+func (s *AuthServiceServerImpl) LogoutAllSessions(ctx context.Context, req *authv1.LogoutAllSessionsRequest) (*authv1.LogoutAllSessionsResponse, error) {
+	log.Printf("LogoutAllSessions request received for client: %s", req.ClientId)
+
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.LogoutAllSessionsResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	claims, _, err := s.authenticateUserToken(ctx, req.AccessToken, req.ClientId)
+	if err != nil {
+		log.Printf("Token validation failed for client %s: %v", req.ClientId, err)
+		return &authv1.LogoutAllSessionsResponse{
+			Success: false,
+			Message: "Invalid token",
+		}, nil
+	}
+
+	revoked, err := s.repo.DeleteUserClientSessions(ctx, claims.Subject, req.ClientId)
+	if err != nil {
+		log.Printf("Error deleting sessions for user %s: %v", claims.Subject, err)
+		return &authv1.LogoutAllSessionsResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	log.Printf("All sessions revoked for user: %s (client: %s, count: %d)", claims.Subject, req.ClientId, revoked)
+	return &authv1.LogoutAllSessionsResponse{
+		Success:      true,
+		Message:      "All sessions logged out",
+		RevokedCount: int32(revoked),
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) GetUserSessions(ctx context.Context, req *authv1.GetUserSessionsRequest) (*authv1.GetUserSessionsResponse, error) {
+	log.Printf("GetUserSessions request received for client: %s", req.ClientId)
+
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.GetUserSessionsResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	claims, current, err := s.authenticateUserToken(ctx, req.AccessToken, req.ClientId)
+	if err != nil {
+		log.Printf("Token validation failed for client %s: %v", req.ClientId, err)
+		return &authv1.GetUserSessionsResponse{
+			Success: false,
+			Message: "Invalid token",
+		}, nil
+	}
+
+	infos, err := listUserSessionInfos(ctx, s.repo, claims.Subject, req.ClientId, current.SessionID)
+	if err != nil {
+		log.Printf("Error listing sessions for user %s: %v", claims.Subject, err)
+		return &authv1.GetUserSessionsResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	return &authv1.GetUserSessionsResponse{
+		Success:  true,
+		Message:  "Sessions retrieved successfully",
+		Sessions: infos,
+	}, nil
+}
+
+func (s *AuthServiceServerImpl) RevokeSession(ctx context.Context, req *authv1.RevokeSessionRequest) (*authv1.RevokeSessionResponse, error) {
+	log.Printf("RevokeSession request received for client: %s", req.ClientId)
+
+	if req.SessionId == "" {
+		return &authv1.RevokeSessionResponse{
+			Success: false,
+			Message: "Session ID is required",
+		}, nil
+	}
+
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.RevokeSessionResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	claims, _, err := s.authenticateUserToken(ctx, req.AccessToken, req.ClientId)
+	if err != nil {
+		log.Printf("Token validation failed for client %s: %v", req.ClientId, err)
+		return &authv1.RevokeSessionResponse{
+			Success: false,
+			Message: "Invalid token",
+		}, nil
+	}
+
+	// The target session must belong to the token's user and client
+	ok, msg := revokeOwnUserSession(ctx, s.repo, claims.Subject, req.ClientId, req.SessionId)
+	return &authv1.RevokeSessionResponse{
+		Success: ok,
+		Message: msg,
+	}, nil
+}
+
 func (s *AuthServiceServerImpl) RegisterClient(ctx context.Context, req *authv1.RegisterClientRequest) (*authv1.RegisterClientResponse, error) {
-	log.Printf("RegisterClient request received for client: %s", req.ClientName)
+	log.Printf("RegisterClient request received")
+
+	if !utils.CheckAdminSecret(req.AdminSecret) {
+		log.Printf("RegisterClient rejected: admin secret mismatch")
+		return &authv1.RegisterClientResponse{
+			Success: false,
+			Message: "Invalid admin credentials",
+		}, nil
+	}
 
 	if req.ClientName == "" {
 		return &authv1.RegisterClientResponse{
@@ -427,11 +783,20 @@ func (s *AuthServiceServerImpl) RegisterClient(ctx context.Context, req *authv1.
 		}, nil
 	}
 
-	// Create client
+	secretHash, err := utils.HashPassword(clientSecret)
+	if err != nil {
+		log.Printf("Error hashing client secret: %v", err)
+		return &authv1.RegisterClientResponse{
+			Success: false,
+			Message: "Internal server error",
+		}, nil
+	}
+
+	// Create client (only the bcrypt hash is stored)
 	client := &models.Client{
-		ClientID:     clientID,
-		ClientName:   req.ClientName,
-		ClientSecret: clientSecret,
+		ClientID:         clientID,
+		ClientName:       req.ClientName,
+		ClientSecretHash: secretHash,
 	}
 
 	if err := s.repo.CreateClient(ctx, client); err != nil {
@@ -452,7 +817,7 @@ func (s *AuthServiceServerImpl) RegisterClient(ctx context.Context, req *authv1.
 }
 
 func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *authv1.ChangeUserPasswordRequest) (*authv1.ChangeUserPasswordResponse, error) {
-	log.Printf("ChangePassword request received")
+	log.Printf("ChangePassword request received for client: %s", req.ClientId)
 
 	if req.AccessToken == "" || req.CurrentPassword == "" || req.NewPassword == "" {
 		return &authv1.ChangeUserPasswordResponse{
@@ -461,79 +826,48 @@ func (s *AuthServiceServerImpl) ChangeUserPassword(ctx context.Context, req *aut
 		}, nil
 	}
 
-	// Validate access token
-	claims, err := utils.ValidateJWTToken(req.AccessToken)
+	// Authenticate client
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.ClientSecret); err != nil {
+		log.Printf("Client authentication failed for client %s: %v", req.ClientId, err)
+		return &authv1.ChangeUserPasswordResponse{
+			Success: false,
+			Message: "Invalid client credentials",
+		}, nil
+	}
+
+	// Validate access token (revocation-aware)
+	claims, currentSession, err := s.authenticateUserToken(ctx, req.AccessToken, req.ClientId)
 	if err != nil {
-		log.Printf("Error validating JWT token: %v", err)
+		log.Printf("Token validation failed for client %s: %v", req.ClientId, err)
 		return &authv1.ChangeUserPasswordResponse{
 			Success: false,
 			Message: "Invalid access token",
 		}, nil
 	}
 
-	// Get user
-	user, err := s.repo.GetUserByID(ctx, claims.UserID)
-	if err != nil {
-		log.Printf("Error getting user by ID: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "User not found",
-		}, nil
-	}
-
-	// Verify current password
-	if !utils.CheckPasswordHash(req.CurrentPassword, user.Password) {
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Current password is incorrect",
-		}, nil
-	}
-
-	// Hash new password
-	hashedNewPassword, err := utils.HashPassword(req.NewPassword)
-	if err != nil {
-		log.Printf("Error hashing new password: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Update password
-	user.Password = hashedNewPassword
-	if err := s.repo.UpdateUser(ctx, user); err != nil {
-		log.Printf("Error updating user password: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Internal server error",
-		}, nil
-	}
-
-	// Invalidate all sessions for this user (security requirement)
-	if err := s.repo.DeleteAllUserSessions(ctx, user.UserID); err != nil {
-		log.Printf("Error invalidating user sessions: %v", err)
-		return &authv1.ChangeUserPasswordResponse{
-			Success: false,
-			Message: "Password changed but failed to invalidate sessions",
-		}, nil
-	}
-
-	log.Printf("Password changed successfully for user: %s", user.UserID)
+	// Shared core: current-password check, >=8 policy, bcrypt, and
+	// invalidation of all OTHER sessions (the caller's stays alive).
+	ok, msg := changeUserPassword(ctx, s.repo, claims.Subject, currentSession.SessionID, req.CurrentPassword, req.NewPassword)
 	return &authv1.ChangeUserPasswordResponse{
-		Success: true,
-		Message: "Password changed successfully. Please log in again.",
+		Success: ok,
+		Message: msg,
 	}, nil
 }
 
 func (s *AuthServiceServerImpl) ChangeClientSecret(ctx context.Context, req *authv1.ChangeClientSecretRequest) (*authv1.ChangeClientSecretResponse, error) {
 	log.Printf("ChangeClientSecret request received for client: %s", req.ClientId)
 
+	if !utils.CheckAdminSecret(req.AdminSecret) {
+		log.Printf("ChangeClientSecret rejected: admin secret mismatch")
+		return &authv1.ChangeClientSecretResponse{Success: false, Message: "Invalid admin credentials"}, nil
+	}
+
 	if req.ClientId == "" || req.CurrentSecret == "" {
 		return &authv1.ChangeClientSecretResponse{Success: false, Message: "client_id and current_secret are required"}, nil
 	}
 
 	// Validate current secret
-	if _, err := s.repo.ValidateClient(ctx, req.ClientId, req.CurrentSecret); err != nil {
+	if _, err := s.authenticateClient(ctx, req.ClientId, req.CurrentSecret); err != nil {
 		return &authv1.ChangeClientSecretResponse{Success: false, Message: "Invalid client credentials"}, nil
 	}
 
@@ -548,7 +882,13 @@ func (s *AuthServiceServerImpl) ChangeClientSecret(ctx context.Context, req *aut
 		newSecret = generated
 	}
 
-	if err := s.repo.UpdateClientSecret(ctx, req.ClientId, newSecret); err != nil {
+	newSecretHash, err := utils.HashPassword(newSecret)
+	if err != nil {
+		log.Printf("Error hashing client secret: %v", err)
+		return &authv1.ChangeClientSecretResponse{Success: false, Message: "Internal server error"}, nil
+	}
+
+	if err := s.repo.UpdateClientSecretHash(ctx, req.ClientId, newSecretHash); err != nil {
 		log.Printf("Error updating client secret: %v", err)
 		return &authv1.ChangeClientSecretResponse{Success: false, Message: "Failed to update client secret"}, nil
 	}
@@ -571,7 +911,7 @@ func (s *AuthServiceServerImpl) validateUserRegistration(req *authv1.RegisterUse
 		return fmt.Errorf("email is required")
 	}
 
-	if !s.isValidEmail(req.Email) {
+	if !isValidEmail(req.Email) {
 		return fmt.Errorf("invalid email format")
 	}
 
@@ -590,7 +930,7 @@ func (s *AuthServiceServerImpl) validateUserRegistration(req *authv1.RegisterUse
 	return nil
 }
 
-func (s *AuthServiceServerImpl) isValidEmail(email string) bool {
+func isValidEmail(email string) bool {
 	email = strings.TrimSpace(email)
 	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 	return emailRegex.MatchString(email)

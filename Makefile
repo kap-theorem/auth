@@ -14,7 +14,7 @@ clean:
 
 # Generate protobuf files
 proto:
-	protoc --go_out=. --go-grpc_out=. proto/auth/v1/auth.proto
+	protoc --go_out=. --go-grpc_out=. proto/auth/v1/auth.proto proto/auth/v1/platform.proto
 
 # Run tests
 test:

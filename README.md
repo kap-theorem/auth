@@ -66,12 +66,54 @@ Create a `.env` file with the following variables:
 # Database Configuration
 DB_CONNECTION_STRING=user:password@tcp(localhost:3306)/authdb?charset=utf8mb4&parseTime=True&loc=Local
 
-# JWT Configuration
-JWT_SECRET=your-super-secure-jwt-secret-key-here-make-it-long-and-random
+# JWT signing (RS256)
+# Path to an RSA private key in PEM format (PKCS#1 or PKCS#8).
+# - If the file does not exist, a 2048-bit dev key is generated and written
+#   to this path (0600) on first use.
+# - If the variable is unset entirely, an ephemeral in-memory dev key is
+#   generated and a warning is logged; tokens will not survive a restart.
+#   Do not run production without a persistent key file.
+JWT_PRIVATE_KEY_FILE=./jwt_private_key.pem
+
+# Admin gate for RegisterClient / ChangeClientSecret.
+# These RPCs fail closed if ADMIN_SECRET is unset.
+ADMIN_SECRET=choose-a-long-random-admin-secret
+
+# TLS on the gRPC listener.
+# Both must be set unless ENV=dev, in which case plaintext is allowed.
+TLS_CERT_FILE=/path/to/server.crt
+TLS_KEY_FILE=/path/to/server.key
+ENV=dev
 
 # Server Configuration
 SERVER_PORT=8080
 ```
+
+## Token Design
+
+- **Access token**: RS256-signed JWT, 30-minute expiry. Claims: `sub`
+  (user_id), `client_id`, `session_id`, `iat`, `exp`, `iss`. No refresh
+  token, username, or email in the payload. `ValidateToken` is
+  revocation-aware: it also checks that the session row still exists.
+- **Refresh token**: opaque `"<session_id>.<secret>"`, where `secret` is
+  256 bits of randomness (hex). The `session_id` prefix is the indexed
+  lookup key (the sessions primary key); only a bcrypt hash of the secret
+  half is stored. Tokens are rotated on every `RefreshToken` call with a
+  sliding 7-day expiry. Presenting a rotated (stale) token is treated as a
+  theft signal and revokes the entire session.
+- **Multi-session**: each login creates a new session row keyed by a
+  `session_id` UUID; users may hold many concurrent sessions per client.
+- **Client credentials**: every RPC (except `HealthCheck`) requires
+  `client_id` + `client_secret`, verified against a bcrypt hash in constant
+  time. Client secrets are shown once at registration/rotation.
+
+## Rate Limits (in-memory token buckets)
+
+- Login (`GetToken`): 5 attempts / email / client / 15 minutes
+- Registration (`RegisterUser`): 10 / client / hour
+- Per-client ceiling: 1000 requests / minute
+
+Buckets are per-process; move to Redis before replicating the service.
 
 ## Database Setup
 
@@ -249,13 +291,96 @@ grpcurl -plaintext -d '{"email": "john@example.com", "password": "password123", 
 5. **Token Refresh**: Use `refresh_token` to get new tokens when access token expires
 6. **Logout**: Invalidate session when user logs out
 
+## Authorization Engine
+
+The `PlatformService` includes a relationship-based authorization engine
+(`pkg/authz`): apps declare their own vocabulary in a versioned **authz
+model**, grant access with **relation tuples**, and evaluate access with
+`Check` / `ListObjects`.
+
+### Authz model schema
+
+`WriteAuthzModel` validates model JSON against this schema (the same shape
+the console uses):
+
+```json
+{
+  "types": {
+    "problem": {
+      "relations": {
+        "author": [],
+        "editor": ["author"],
+        "viewer": ["editor"]
+      }
+    }
+  }
+}
+```
+
+- Each object type declares its relations; a relation maps to the list of
+  **stronger relations that imply it** (`"viewer": ["editor"]` = an editor
+  is also a viewer). Implications chain transitively: checking `viewer`
+  accepts `author`/`editor`/`viewer` tuples.
+- Validation rejects unknown top-level keys, relations named in an
+  implication list but not declared on the type, and cycles in the
+  implication graph (self-implication included).
+- Models are versioned; checks always evaluate against the latest version.
+
+### Check resolution
+
+`Check(client, subject, relation, object, context)` resolves in order:
+
+1. **Deny pass first** — deny tuples match the *exact* relation only (deny
+   never travels through implications) but use full subject expansion
+   (userset hops). Any match denies immediately (deny always wins).
+2. **Allow pass** — the requested relation expands through the model's
+   implications; tuples match the subject directly or via a **userset
+   hop**: a tuple whose subject is `role:R` grants to anyone who has the
+   `member` relation on the object `role:R` (role membership is itself
+   ordinary tuples, so roles can nest).
+3. **Conditions** — a tuple with a `condition_expr` only matches when the
+   expression evaluates true against the request's context map; parse
+   errors and missing context keys fail closed.
+4. **Default deny.** Recursion is depth-limited (20); exceeding the limit
+   denies with an explanatory reason.
+
+`ListObjects(subject, relation, object_type)` returns every object id of a
+type the subject can reach for a relation (reverse expansion over the
+subject index, confirmed by the forward resolver). Conditions are evaluated
+with an empty context, so conditioned allows are excluded.
+
+### Condition expression language
+
+Minimal ABAC grammar over the Check context map (see
+`pkg/authz/condition.go`):
+
+```
+expr       = orExpr
+orExpr     = andExpr { "||" andExpr }
+andExpr    = term { "&&" term }
+term       = "(" expr ")" | comparison
+comparison = operand ("==" | "!=" | "<" | "<=" | ">" | ">=") operand
+operand    = "string" | number | now() | context_key
+```
+
+Examples: `env == "staging"`, `attempts < 3 && env != "prod"`,
+`(tier == "gold" || tier == "silver") && now() < "2027-01-01T00:00:00Z"`.
+Comparisons are numeric when both sides parse as numbers, lexicographic
+strings otherwise; `now()` yields the current UTC time in RFC3339 so it
+compares correctly against RFC3339 `Z` literals. Any parse error or missing
+context key makes the condition false (fail closed).
+
 ## Security Features
 
-- **Password Hashing**: bcrypt with salt
-- **JWT Tokens**: HMAC-SHA256 signed tokens
-- **Session Management**: Secure refresh token rotation
-- **Client Validation**: Multi-tenant support with client isolation
-- **Input Validation**: Email format, password strength, required fields
+- **Password Hashing**: bcrypt with salt (user passwords, client secrets, refresh tokens)
+- **JWT Tokens**: RS256 signed tokens, 30-minute expiry, revocation-aware validation
+- **Session Management**: Multi-session per user with rotated refresh tokens; reuse of a rotated token revokes the session
+- **Client Validation**: Multi-tenant support with client isolation; email uniqueness is scoped per client; client secret required on every RPC
+- **Admin Gate**: `RegisterClient` / `ChangeClientSecret` require `ADMIN_SECRET`
+- **Rate Limiting**: in-memory token buckets on login, registration, and per-client volume
+- **TLS**: required on the listener unless `ENV=dev`
+- **Input Validation**: Email format, password strength (≥8 chars, also on password change), required fields
+- **No PII in logs**: user_ids and client_ids only — never emails or tokens
 - **Automatic Cleanup**: Expired sessions are cleaned up hourly
 
 ## Error Handling

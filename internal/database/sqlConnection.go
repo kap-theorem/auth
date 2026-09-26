@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -115,26 +116,31 @@ func (dbCon *DBConnection) createTablesIfNotExist() error {
 
 	log.Println("Running database migrations...")
 
-	// Create Client table first (no dependencies)
-	if err := dbCon.AutoMigrate(&models.Client{}); err != nil {
-		log.Printf("Error migrating Client table: %v", err)
+	// Phase 2: rewrite users.client_id into (scope_type, scope_id) BEFORE
+	// AutoMigrate creates the new UNIQUE(email, scope_type, scope_id) index,
+	// otherwise unmigrated rows would collide on empty scope values.
+	if err := dbCon.migrateUserScoping(); err != nil {
+		log.Printf("Error migrating user scoping columns: %v", err)
 		return err
 	}
-	log.Println("Clients table migration completed")
 
-	// Create User table second (depends on Client)
-	if err := dbCon.AutoMigrate(&models.User{}); err != nil {
-		log.Printf("Error migrating User table: %v", err)
+	// Rename pre-existing duplicate usernames BEFORE AutoMigrate creates the
+	// new UNIQUE(user_name, scope_type, scope_id) index, otherwise the index
+	// creation would fail on the duplicate rows.
+	if err := dbCon.migrateUsernameUniqueness(); err != nil {
+		log.Printf("Error reconciling duplicate usernames: %v", err)
 		return err
 	}
-	log.Println("Users table migration completed")
 
-	// Create Session table last (depends on User and Client)
-	if err := dbCon.AutoMigrate(&models.Session{}); err != nil {
-		log.Printf("Error migrating Session table: %v", err)
-		return err
+	// Migrate in dependency order (orgs -> clients/developers -> users ->
+	// sessions -> tuples/models).
+	for _, model := range models.GetAllModels() {
+		if err := dbCon.AutoMigrate(model); err != nil {
+			log.Printf("Error migrating table for %T: %v", model, err)
+			return err
+		}
 	}
-	log.Println("Sessions table migration completed")
+	log.Println("Table migrations completed")
 
 	// Add foreign key constraints if they don't exist
 	dbCon.addForeignKeyConstraintsIfNotExist()
@@ -142,23 +148,105 @@ func (dbCon *DBConnection) createTablesIfNotExist() error {
 	return nil
 }
 
+// migrateUserScoping converts the Phase 1 users.client_id column into the
+// Phase 2 (scope_type, scope_id) pair: existing rows become app-scoped
+// (scope_type='app', scope_id=client_id). Idempotent: it only runs when the
+// legacy client_id column is still present.
+func (dbCon *DBConnection) migrateUserScoping() error {
+	migrator := dbCon.Migrator()
+	if !migrator.HasTable("users") || !migrator.HasColumn(&models.User{}, "client_id") {
+		return nil // fresh install or already migrated
+	}
+
+	log.Println("Migrating users.client_id -> (scope_type, scope_id)...")
+
+	if !migrator.HasColumn(&models.User{}, "scope_type") {
+		if err := dbCon.Exec(`ALTER TABLE users ADD COLUMN scope_type VARCHAR(8) NOT NULL DEFAULT 'app'`).Error; err != nil {
+			return err
+		}
+	}
+	if !migrator.HasColumn(&models.User{}, "scope_id") {
+		if err := dbCon.Exec(`ALTER TABLE users ADD COLUMN scope_id VARCHAR(36) NOT NULL DEFAULT ''`).Error; err != nil {
+			return err
+		}
+	}
+
+	// Backfill: every existing user is app-scoped to its former client.
+	if err := dbCon.Exec(`UPDATE users SET scope_type = 'app', scope_id = client_id WHERE scope_id = ''`).Error; err != nil {
+		return err
+	}
+
+	// Drop the legacy FK, unique index, and column.
+	if dbCon.constraintExists("users", "fk_users_client_id") {
+		if err := dbCon.Exec(`ALTER TABLE users DROP FOREIGN KEY fk_users_client_id`).Error; err != nil {
+			log.Printf("Warning: could not drop fk_users_client_id: %v", err)
+		}
+	}
+	if migrator.HasIndex(&models.User{}, "idx_users_email_client") {
+		if err := migrator.DropIndex(&models.User{}, "idx_users_email_client"); err != nil {
+			log.Printf("Warning: could not drop idx_users_email_client: %v", err)
+		}
+	}
+	if err := dbCon.Exec(`ALTER TABLE users DROP COLUMN client_id`).Error; err != nil {
+		return err
+	}
+
+	log.Println("User scoping migration completed")
+	return nil
+}
+
+// migrateUsernameUniqueness renames pre-existing duplicate usernames within
+// each identity scope so the UNIQUE(user_name, scope_type, scope_id) index can
+// be created. The oldest row (by created_at, then user_id) keeps the name; the
+// rest are suffixed "-2", "-3", … to the first free name in scope. Idempotent:
+// only runs when the unique index does not yet exist.
+func (dbCon *DBConnection) migrateUsernameUniqueness() error {
+	migrator := dbCon.Migrator()
+	if !migrator.HasTable("users") || migrator.HasIndex(&models.User{}, "idx_users_username_scope") {
+		return nil // fresh install (AutoMigrate creates it) or already reconciled
+	}
+
+	var users []models.User
+	if err := dbCon.Order("created_at asc, user_id asc").Find(&users).Error; err != nil {
+		return err
+	}
+
+	type scopeKey struct{ t, id string }
+	taken := map[scopeKey]map[string]bool{}
+	renamed := 0
+	for i := range users {
+		u := &users[i]
+		k := scopeKey{u.ScopeType, u.ScopeID}
+		if taken[k] == nil {
+			taken[k] = map[string]bool{}
+		}
+		if !taken[k][u.UserName] {
+			taken[k][u.UserName] = true
+			continue
+		}
+		newName := u.UserName
+		for n := 2; taken[k][newName]; n++ {
+			newName = fmt.Sprintf("%s-%d", u.UserName, n)
+		}
+		log.Printf("  renaming duplicate username %q -> %q (scope %s:%s, user %s)", u.UserName, newName, u.ScopeType, u.ScopeID, u.UserID)
+		if err := dbCon.Model(&models.User{}).Where("user_id = ?", u.UserID).Update("user_name", newName).Error; err != nil {
+			return err
+		}
+		taken[k][newName] = true
+		renamed++
+	}
+	if renamed > 0 {
+		log.Printf("Username reconciliation completed (%d renamed)", renamed)
+	}
+	return nil
+}
+
 func (dbCon *DBConnection) addForeignKeyConstraintsIfNotExist() {
 	log.Println("Checking and adding foreign key constraints if needed...")
 
-	// Check and add foreign key constraint for User -> Client
-	if !dbCon.constraintExists("users", "fk_users_client_id") {
-		result := dbCon.Exec(`
-			ALTER TABLE users 
-			ADD CONSTRAINT fk_users_client_id 
-			FOREIGN KEY (client_id) REFERENCES clients(client_id) 
-			ON UPDATE CASCADE ON DELETE CASCADE
-		`)
-		if result.Error != nil {
-			log.Printf("Warning: Could not add user->client constraint: %v", result.Error)
-		} else {
-			log.Println("Added foreign key constraint: fk_users_client_id")
-		}
-	}
+	// Note: users no longer reference clients directly — they are scoped via
+	// (scope_type, scope_id), which may point at a client OR an org, so no
+	// FK is possible there.
 
 	// Check and add foreign key constraint for Session -> User
 	if !dbCon.constraintExists("sessions", "fk_sessions_user_id") {

@@ -3,9 +3,11 @@ package repository
 import (
 	"authservice/pkg/models"
 	"context"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type AuthRepository struct {
@@ -21,9 +23,22 @@ func (r *AuthRepository) CreateUser(ctx context.Context, user *models.User) erro
 	return r.db.WithContext(ctx).Create(user).Error
 }
 
-func (r *AuthRepository) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+// GetUserByEmail resolves a user by email within an identity scope
+// (email uniqueness is per scope: app or org).
+func (r *AuthRepository) GetUserByEmail(ctx context.Context, email, scopeType, scopeID string) (*models.User, error) {
 	var user models.User
-	err := r.db.WithContext(ctx).Where("email = ?", email).First(&user).Error
+	err := r.db.WithContext(ctx).Where("email_id = ? AND scope_type = ? AND scope_id = ?", email, scopeType, scopeID).First(&user).Error
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// GetUserByUsername resolves a user by username within an identity scope
+// (username uniqueness is per scope: app or org).
+func (r *AuthRepository) GetUserByUsername(ctx context.Context, username, scopeType, scopeID string) (*models.User, error) {
+	var user models.User
+	err := r.db.WithContext(ctx).Where("user_name = ? AND scope_type = ? AND scope_id = ?", username, scopeType, scopeID).First(&user).Error
 	if err != nil {
 		return nil, err
 	}
@@ -47,6 +62,64 @@ func (r *AuthRepository) DeleteUser(ctx context.Context, userID string) error {
 	return r.db.WithContext(ctx).Delete(&models.User{}, "user_id = ?", userID).Error
 }
 
+// SetUserActive flips a user's active flag. Deactivated users cannot log in
+// through any flow and their existing tokens stop validating.
+func (r *AuthRepository) SetUserActive(ctx context.Context, userID string, active bool) error {
+	return r.db.WithContext(ctx).
+		Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("active", active).Error
+}
+
+// escapeLike escapes SQL LIKE metacharacters so user-supplied query text is
+// matched literally. Uses '!' as the escape char (ESCAPE '!' alongside):
+// a literal '\' breaks MySQL string literals while SQLite rejects
+// multi-char escapes, so backslash can't be dialect-neutral here.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `!`, `!!`)
+	s = strings.ReplaceAll(s, `%`, `!%`)
+	return strings.ReplaceAll(s, `_`, `!_`)
+}
+
+// ListUsersByScope lists an identity scope's users (one app's user base, or
+// an org's shared pool), optionally filtered by a substring match on
+// username OR email.
+func (r *AuthRepository) ListUsersByScope(ctx context.Context, scopeType, scopeID, query string) ([]models.User, error) {
+	q := r.db.WithContext(ctx).Where("scope_type = ? AND scope_id = ?", scopeType, scopeID)
+	if query != "" {
+		like := "%" + escapeLike(query) + "%"
+		q = q.Where(`(user_name LIKE ? ESCAPE '!' OR email_id LIKE ? ESCAPE '!')`, like, like)
+	}
+	var users []models.User
+	if err := q.Order("created_at ASC").Find(&users).Error; err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+// CountSessionsByUserForClient returns active-session counts per user under
+// one client (one grouped query for the admin Users listing).
+func (r *AuthRepository) CountSessionsByUserForClient(ctx context.Context, clientID string) (map[string]int64, error) {
+	var rows []struct {
+		UserID string
+		N      int64
+	}
+	err := r.db.WithContext(ctx).
+		Model(&models.Session{}).
+		Select("user_id, COUNT(*) AS n").
+		Where("client_id = ? AND expires_at > ?", clientID, time.Now()).
+		Group("user_id").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		counts[row.UserID] = row.N
+	}
+	return counts, nil
+}
+
 // Client operations
 func (r *AuthRepository) CreateClient(ctx context.Context, client *models.Client) error {
 	return r.db.WithContext(ctx).Create(client).Error
@@ -61,53 +134,58 @@ func (r *AuthRepository) GetClientByID(ctx context.Context, clientID string) (*m
 	return &client, nil
 }
 
-func (r *AuthRepository) ValidateClient(ctx context.Context, clientID, clientSecret string) (*models.Client, error) {
-	var client models.Client
-	err := r.db.WithContext(ctx).Where("client_id = ? AND client_secret = ?", clientID, clientSecret).First(&client).Error
-	if err != nil {
-		return nil, err
-	}
-	return &client, nil
-}
-
-// UpdateClientSecret updates the client's secret value
-func (r *AuthRepository) UpdateClientSecret(ctx context.Context, clientID, newSecret string) error {
+// UpdateClientSecretHash updates the client's stored secret hash.
+func (r *AuthRepository) UpdateClientSecretHash(ctx context.Context, clientID, newSecretHash string) error {
 	return r.db.WithContext(ctx).
 		Model(&models.Client{}).
 		Where("client_id = ?", clientID).
-		Update("client_secret", newSecret).Error
+		Update("client_secret", newSecretHash).Error
 }
 
 // Session operations
-func (r *AuthRepository) CreateOrUpdateSession(ctx context.Context, session *models.Session) error {
-	// This will either create or update based on the composite primary key (UserId + ClientId)
+func (r *AuthRepository) CreateSession(ctx context.Context, session *models.Session) error {
+	return r.db.WithContext(ctx).Create(session).Error
+}
+
+func (r *AuthRepository) UpdateSession(ctx context.Context, session *models.Session) error {
 	return r.db.WithContext(ctx).Save(session).Error
 }
 
-func (r *AuthRepository) GetSessionByUserAndClient(ctx context.Context, userID, clientID string) (*models.Session, error) {
+func (r *AuthRepository) GetSessionByID(ctx context.Context, sessionID string) (*models.Session, error) {
 	var session models.Session
-	err := r.db.WithContext(ctx).Where("user_id = ? AND client_id = ? AND expires_at > ?", userID, clientID, time.Now()).First(&session).Error
+	err := r.db.WithContext(ctx).Where("session_id = ? AND expires_at > ?", sessionID, time.Now()).First(&session).Error
 	if err != nil {
 		return nil, err
 	}
 	return &session, nil
 }
 
-func (r *AuthRepository) GetSessionByRefreshToken(ctx context.Context, refreshToken string) (*models.Session, error) {
-	var session models.Session
-	err := r.db.WithContext(ctx).Where("refresh_token = ? AND expires_at > ?", refreshToken, time.Now()).First(&session).Error
+// GetSessionsByUserAndClient lists all active sessions for a user under a client.
+func (r *AuthRepository) GetSessionsByUserAndClient(ctx context.Context, userID, clientID string) ([]models.Session, error) {
+	var sessions []models.Session
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND client_id = ? AND expires_at > ?", userID, clientID, time.Now()).
+		Order("created_at ASC").
+		Find(&sessions).Error
 	if err != nil {
 		return nil, err
 	}
-	return &session, nil
+	return sessions, nil
 }
 
-func (r *AuthRepository) DeleteSessionByUserAndClient(ctx context.Context, userID, clientID string) error {
-	return r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND client_id = ?", userID, clientID).Error
+func (r *AuthRepository) DeleteSessionByID(ctx context.Context, sessionID string) error {
+	return r.db.WithContext(ctx).Delete(&models.Session{}, "session_id = ?", sessionID).Error
 }
 
-func (r *AuthRepository) DeleteSessionByRefreshToken(ctx context.Context, refreshToken string) error {
-	return r.db.WithContext(ctx).Delete(&models.Session{}, "refresh_token = ?", refreshToken).Error
+// DeleteUserClientSessions removes every session a user holds under a client.
+func (r *AuthRepository) DeleteUserClientSessions(ctx context.Context, userID, clientID string) (int64, error) {
+	result := r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND client_id = ?", userID, clientID)
+	return result.RowsAffected, result.Error
+}
+
+// DeleteOtherUserSessions removes all of a user's sessions except the one to keep.
+func (r *AuthRepository) DeleteOtherUserSessions(ctx context.Context, userID, keepSessionID string) error {
+	return r.db.WithContext(ctx).Delete(&models.Session{}, "user_id = ? AND session_id <> ?", userID, keepSessionID).Error
 }
 
 func (r *AuthRepository) DeleteAllUserSessions(ctx context.Context, userID string) error {
@@ -119,9 +197,40 @@ func (r *AuthRepository) DeleteExpiredSessions(ctx context.Context) error {
 }
 
 // Utility functions
-func (r *AuthRepository) IsEmailExists(ctx context.Context, email string) (bool, error) {
+func (r *AuthRepository) IsEmailExists(ctx context.Context, email, scopeType, scopeID string) (bool, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ?", email).Count(&count).Error
+	err := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ? AND scope_type = ? AND scope_id = ?", email, scopeType, scopeID).Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// IsUsernameExists reports whether a username is taken within an identity
+// scope (username uniqueness is per scope). excludeUserID, when non-empty, is
+// ignored in the count — used by profile/admin edits to allow a no-op rename.
+func (r *AuthRepository) IsUsernameExists(ctx context.Context, username, scopeType, scopeID, excludeUserID string) (bool, error) {
+	var count int64
+	q := r.db.WithContext(ctx).Model(&models.User{}).Where("user_name = ? AND scope_type = ? AND scope_id = ?", username, scopeType, scopeID)
+	if excludeUserID != "" {
+		q = q.Where("user_id <> ?", excludeUserID)
+	}
+	err := q.Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// IsEmailExistsExcluding is IsEmailExists with an excluded user id, used by
+// profile/admin edits so an unchanged email is not treated as a conflict.
+func (r *AuthRepository) IsEmailExistsExcluding(ctx context.Context, email, scopeType, scopeID, excludeUserID string) (bool, error) {
+	var count int64
+	q := r.db.WithContext(ctx).Model(&models.User{}).Where("email_id = ? AND scope_type = ? AND scope_id = ?", email, scopeType, scopeID)
+	if excludeUserID != "" {
+		q = q.Where("user_id <> ?", excludeUserID)
+	}
+	err := q.Count(&count).Error
 	if err != nil {
 		return false, err
 	}
@@ -135,4 +244,240 @@ func (r *AuthRepository) IsClientExists(ctx context.Context, clientID string) (b
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// Organization operations
+func (r *AuthRepository) CreateOrganization(ctx context.Context, org *models.Organization) error {
+	return r.db.WithContext(ctx).Create(org).Error
+}
+
+func (r *AuthRepository) GetOrganizationByID(ctx context.Context, orgID string) (*models.Organization, error) {
+	var org models.Organization
+	err := r.db.WithContext(ctx).Where("org_id = ?", orgID).First(&org).Error
+	if err != nil {
+		return nil, err
+	}
+	return &org, nil
+}
+
+func (r *AuthRepository) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
+	var orgs []models.Organization
+	err := r.db.WithContext(ctx).Order("created_at ASC").Find(&orgs).Error
+	if err != nil {
+		return nil, err
+	}
+	return orgs, nil
+}
+
+// Developer operations
+func (r *AuthRepository) CreateDeveloper(ctx context.Context, dev *models.Developer) error {
+	return r.db.WithContext(ctx).Create(dev).Error
+}
+
+func (r *AuthRepository) GetDeveloperByID(ctx context.Context, developerID string) (*models.Developer, error) {
+	var dev models.Developer
+	err := r.db.WithContext(ctx).Where("developer_id = ?", developerID).First(&dev).Error
+	if err != nil {
+		return nil, err
+	}
+	return &dev, nil
+}
+
+func (r *AuthRepository) GetDeveloperByEmail(ctx context.Context, email string) (*models.Developer, error) {
+	var dev models.Developer
+	err := r.db.WithContext(ctx).Where("email = ?", email).First(&dev).Error
+	if err != nil {
+		return nil, err
+	}
+	return &dev, nil
+}
+
+func (r *AuthRepository) ListDevelopers(ctx context.Context) ([]models.Developer, error) {
+	var devs []models.Developer
+	err := r.db.WithContext(ctx).Order("created_at ASC").Find(&devs).Error
+	if err != nil {
+		return nil, err
+	}
+	return devs, nil
+}
+
+// Client (app) management operations
+func (r *AuthRepository) ListClientsByOrg(ctx context.Context, orgID string) ([]models.Client, error) {
+	var clients []models.Client
+	err := r.db.WithContext(ctx).Where("org_id = ?", orgID).Order("created_at ASC").Find(&clients).Error
+	if err != nil {
+		return nil, err
+	}
+	return clients, nil
+}
+
+func (r *AuthRepository) ListAllClients(ctx context.Context) ([]models.Client, error) {
+	var clients []models.Client
+	err := r.db.WithContext(ctx).Order("created_at ASC").Find(&clients).Error
+	if err != nil {
+		return nil, err
+	}
+	return clients, nil
+}
+
+func (r *AuthRepository) UpdateClient(ctx context.Context, client *models.Client) error {
+	return r.db.WithContext(ctx).Save(client).Error
+}
+
+// DeleteClient soft-deletes a client (app).
+func (r *AuthRepository) DeleteClient(ctx context.Context, clientID string) error {
+	return r.db.WithContext(ctx).Delete(&models.Client{}, "client_id = ?", clientID).Error
+}
+
+// SetClientSuspended flips a client's suspended flag. Suspended clients fail
+// all RPC authentication.
+func (r *AuthRepository) SetClientSuspended(ctx context.Context, clientID string, suspended bool) error {
+	return r.db.WithContext(ctx).
+		Model(&models.Client{}).
+		Where("client_id = ?", clientID).
+		Update("suspended", suspended).Error
+}
+
+// Relation tuple operations
+// UpsertTuples writes tuples, overwriting the condition of an existing tuple
+// with the same primary key.
+func (r *AuthRepository) UpsertTuples(ctx context.Context, tuples []models.RelationTuple) error {
+	if len(tuples) == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).
+		Clauses(clause.OnConflict{UpdateAll: true}).
+		Create(&tuples).Error
+}
+
+// DeleteTuple removes one tuple by its full primary key (condition_expr is
+// not part of the key).
+func (r *AuthRepository) DeleteTuple(ctx context.Context, t *models.RelationTuple) error {
+	return r.db.WithContext(ctx).Delete(&models.RelationTuple{},
+		"client_id = ? AND object_type = ? AND object_id = ? AND relation = ? AND subject_type = ? AND subject_id = ? AND effect = ?",
+		t.ClientID, t.ObjectType, t.ObjectID, t.Relation, t.SubjectType, t.SubjectID, t.Effect).Error
+}
+
+// ListTuples returns a client's tuples, optionally filtered by object and/or
+// subject (empty filter fields match anything).
+func (r *AuthRepository) ListTuples(ctx context.Context, clientID, objectType, objectID, subjectType, subjectID string) ([]models.RelationTuple, error) {
+	q := r.db.WithContext(ctx).Where("client_id = ?", clientID)
+	if objectType != "" {
+		q = q.Where("object_type = ?", objectType)
+	}
+	if objectID != "" {
+		q = q.Where("object_id = ?", objectID)
+	}
+	if subjectType != "" {
+		q = q.Where("subject_type = ?", subjectType)
+	}
+	if subjectID != "" {
+		q = q.Where("subject_id = ?", subjectID)
+	}
+	var tuples []models.RelationTuple
+	if err := q.Order("created_at ASC").Find(&tuples).Error; err != nil {
+		return nil, err
+	}
+	return tuples, nil
+}
+
+// TuplesForObject returns every tuple (any relation, any effect) on one
+// object within a client scope — the resolver's forward lookup
+// (authz.TupleStore).
+func (r *AuthRepository) TuplesForObject(ctx context.Context, clientID, objectType, objectID string) ([]models.RelationTuple, error) {
+	var tuples []models.RelationTuple
+	err := r.db.WithContext(ctx).
+		Where("client_id = ? AND object_type = ? AND object_id = ?", clientID, objectType, objectID).
+		Find(&tuples).Error
+	if err != nil {
+		return nil, err
+	}
+	return tuples, nil
+}
+
+// TuplesBySubject returns every tuple within a client scope whose subject
+// matches, restricted to one object type — the resolver's reverse lookup
+// (authz.TupleStore), served by idx_relation_tuples_subject.
+func (r *AuthRepository) TuplesBySubject(ctx context.Context, clientID, subjectType, subjectID, objectType string) ([]models.RelationTuple, error) {
+	var tuples []models.RelationTuple
+	err := r.db.WithContext(ctx).
+		Where("client_id = ? AND subject_type = ? AND subject_id = ? AND object_type = ?",
+			clientID, subjectType, subjectID, objectType).
+		Find(&tuples).Error
+	if err != nil {
+		return nil, err
+	}
+	return tuples, nil
+}
+
+// Authz model operations
+// CreateAuthzModelVersion stores model JSON as the next version for the
+// client and returns the new version number.
+func (r *AuthRepository) CreateAuthzModelVersion(ctx context.Context, clientID, modelJSON string) (int32, error) {
+	var version int32
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var latest int32
+		if err := tx.Model(&models.AuthzModel{}).
+			Where("client_id = ?", clientID).
+			Select("COALESCE(MAX(version), 0)").
+			Scan(&latest).Error; err != nil {
+			return err
+		}
+		version = latest + 1
+		return tx.Create(&models.AuthzModel{
+			ClientID:  clientID,
+			Version:   version,
+			ModelJSON: modelJSON,
+		}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// GetLatestAuthzModel returns the newest model version for a client.
+func (r *AuthRepository) GetLatestAuthzModel(ctx context.Context, clientID string) (*models.AuthzModel, error) {
+	var model models.AuthzModel
+	err := r.db.WithContext(ctx).
+		Where("client_id = ?", clientID).
+		Order("version DESC").
+		First(&model).Error
+	if err != nil {
+		return nil, err
+	}
+	return &model, nil
+}
+
+// Platform metrics
+func (r *AuthRepository) CountDevelopers(ctx context.Context) (int64, error) {
+	return r.count(ctx, &models.Developer{})
+}
+
+func (r *AuthRepository) CountOrganizations(ctx context.Context) (int64, error) {
+	return r.count(ctx, &models.Organization{})
+}
+
+func (r *AuthRepository) CountClients(ctx context.Context) (int64, error) {
+	return r.count(ctx, &models.Client{})
+}
+
+func (r *AuthRepository) CountUsers(ctx context.Context) (int64, error) {
+	return r.count(ctx, &models.User{})
+}
+
+func (r *AuthRepository) CountActiveSessions(ctx context.Context) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Session{}).Where("expires_at > ?", time.Now()).Count(&count).Error
+	return count, err
+}
+
+func (r *AuthRepository) CountTuples(ctx context.Context) (int64, error) {
+	return r.count(ctx, &models.RelationTuple{})
+}
+
+func (r *AuthRepository) count(ctx context.Context, model any) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(model).Count(&count).Error
+	return count, err
 }

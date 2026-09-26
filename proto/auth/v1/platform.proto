@@ -1,0 +1,709 @@
+syntax = "proto3";
+
+package auth.v1;
+
+// Use module import path with package alias for Go codegen
+option go_package = "./proto/auth/v1";
+
+import "google/protobuf/timestamp.proto";
+import "proto/auth/v1/auth.proto";
+
+// PlatformService is the Phase 2 tenant-management + minimal authz surface.
+// Developers are users of the built-in "platform" client (dogfooding the
+// AuthService user/session/JWT machinery); all RPCs below authenticate via
+// a developer access token unless noted otherwise.
+service PlatformService {
+  // Developer accounts
+  // Registers a developer and auto-creates their personal organization
+  rpc RegisterDeveloper(RegisterDeveloperRequest) returns (RegisterDeveloperResponse);
+  // Logs a developer in (platform client) and returns tokens + profile
+  rpc DeveloperLogin(DeveloperLoginRequest) returns (DeveloperLoginResponse);
+  // Refreshes a developer session. Server-side this wraps the AuthService
+  // refresh machinery using the platform client's own credentials (the
+  // browser never holds a client secret), with the same rotation and
+  // reuse-revocation semantics: replaying a rotated refresh token revokes
+  // the whole session.
+  rpc DeveloperRefreshToken(DeveloperRefreshTokenRequest) returns (DeveloperRefreshTokenResponse);
+
+  // App (client) management — developer token + org ownership required
+  // Creates an app under the developer's org; secret is returned once
+  rpc CreateApp(CreateAppRequest) returns (CreateAppResponse);
+  // Lists the developer's own org's apps
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+  // Updates an app's name and/or identity_scope
+  rpc UpdateApp(UpdateAppRequest) returns (UpdateAppResponse);
+  // Rotates an app's secret; the new secret is returned once
+  rpc RotateAppSecret(RotateAppSecretRequest) returns (RotateAppSecretResponse);
+  // Soft-deletes an app
+  rpc DeleteApp(DeleteAppRequest) returns (DeleteAppResponse);
+
+  // Authorization (Phase 3 resolver: deny pass first on the exact relation
+  // — deny never travels through implications — then an allow pass with
+  // model implication expansion and role/userset hops; ABAC conditions
+  // evaluated against the request context, failing closed; recursion
+  // depth-limited at 20; default deny)
+  // Evaluates a check in the calling token's client scope
+  rpc Check(CheckRequest) returns (CheckResponse);
+  // Lists every object of a type the subject can reach for a relation
+  // (reverse expansion via the subject index, confirmed by the forward
+  // resolver). Conditions are evaluated with an EMPTY context, so
+  // conditioned allow tuples are excluded from the results.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  // Writes (upserts) relation tuples for an app the developer owns
+  rpc WriteTuples(WriteTuplesRequest) returns (WriteTuplesResponse);
+  // Deletes relation tuples for an app the developer owns
+  rpc DeleteTuples(DeleteTuplesRequest) returns (DeleteTuplesResponse);
+  // Lists relation tuples for an app the developer owns
+  rpc ListTuples(ListTuplesRequest) returns (ListTuplesResponse);
+  // Stores a new version of an app's authz model, validated against the
+  // schema {"types": {"<type>": {"relations": {"<relation>":
+  // ["<relations that imply it>"]}}}} — unknown relations in implication
+  // lists and implication cycles are rejected
+  rpc WriteAuthzModel(WriteAuthzModelRequest) returns (WriteAuthzModelResponse);
+  // Returns the latest version of an app's authz model
+  rpc GetAuthzModel(GetAuthzModelRequest) returns (GetAuthzModelResponse);
+
+  // Hosted login (spec "Hosted login", added 2026-07-18)
+  // Public app metadata for the hosted login page. NO auth: returns only
+  // {success, name, hosted_login_enabled} and never anything else.
+  rpc GetAppPublicInfo(GetAppPublicInfoRequest) returns (GetAppPublicInfoResponse);
+  // Client-secret-free end-user login for the platform-hosted login page.
+  // Succeeds only when redirect_uri EXACTLY matches one of the app's
+  // whitelisted redirect_uris (the whitelist is the trust anchor) and the
+  // app is not suspended. Same response shape as AuthService.GetToken;
+  // rate-limited with the same per-email login limiter as GetToken.
+  rpc HostedLogin(HostedLoginRequest) returns (HostedLoginResponse);
+  // Client-secret-free ONE-CLICK demo login for the hosted login page.
+  // Succeeds only when the app has demo login enabled and redirect_uri
+  // EXACTLY matches a whitelisted redirect_uri. Logs in the app's configured
+  // demo account server-side (its password is never sent to the browser).
+  rpc HostedDemoLogin(HostedDemoLoginRequest) returns (HostedDemoLoginResponse);
+  // Client-secret-free public self-serve signup for the hosted login page.
+  // Succeeds only when the app has public_signup enabled and redirect_uri
+  // EXACTLY matches a whitelisted redirect_uri. On success the new user is
+  // logged in (same response shape as HostedLogin). Rate-limited per client
+  // AND per client IP.
+  rpc HostedRegister(HostedRegisterRequest) returns (HostedRegisterResponse);
+
+  // Hosted account page (spec "Hosted account page", added 2026-07-18)
+  // All four RPCs are authenticated purely by the END USER's access token
+  // (no client secret in the browser) and enforce BOTH: the token's
+  // client_id equals the request's client_id, AND hosted pages are enabled
+  // for the app (redirect whitelist non-empty, not suspended). Rate-limited
+  // by the per-client global ceiling (they carry client_id).
+  // Returns the token owner's profile and active sessions for this client.
+  rpc HostedGetProfile(HostedGetProfileRequest) returns (HostedGetProfileResponse);
+  // Same semantics as AuthService.ChangeUserPassword: verify the current
+  // password, >=8 chars policy, bcrypt; all OTHER sessions are invalidated
+  // (the caller's session stays alive).
+  rpc HostedChangePassword(HostedChangePasswordRequest) returns (HostedChangePasswordResponse);
+  // Revokes one of the token owner's OWN sessions under this client.
+  rpc HostedRevokeSession(HostedRevokeSessionRequest) returns (HostedRevokeSessionResponse);
+  // Revokes ALL of the token owner's sessions for this client, including
+  // the current one.
+  rpc HostedLogoutAll(HostedLogoutAllRequest) returns (HostedLogoutAllResponse);
+  // Self-edit of the token owner's own username and/or email. Rejects any
+  // field the admin has locked (lock_username / lock_email). Enforces the
+  // per-scope username and email uniqueness invariants.
+  rpc HostedUpdateProfile(HostedUpdateProfileRequest) returns (HostedUpdateProfileResponse);
+
+  // App user management (spec "App user management", added 2026-07-19)
+  // All four RPCs take a developer token; the app must belong to the
+  // caller's org (or the caller must be a superadmin). "Users of the app"
+  // = app-scoped users (scope_type='app', scope_id=client_id) plus, when
+  // the app is org-scoped, the org's shared user pool — each row is
+  // labeled with its scope ("app" | "org").
+  // Lists an app's end users; query does a substring match on username or
+  // email.
+  rpc ListAppUsers(ListAppUsersRequest) returns (ListAppUsersResponse);
+  // Lists one user's active sessions under this app.
+  rpc ListUserSessionsAdmin(ListUserSessionsAdminRequest) returns (ListUserSessionsAdminResponse);
+  // Revokes ALL of one user's sessions under this app.
+  rpc RevokeUserSessionsAdmin(RevokeUserSessionsAdminRequest) returns (RevokeUserSessionsAdminResponse);
+  // Activates/deactivates a user. Deactivation revokes ALL of the user's
+  // sessions — across every client for org-scoped users, because the
+  // IDENTITY is disabled, not just its access to one app — and blocks
+  // every login flow until reactivation.
+  rpc SetUserActive(SetUserActiveRequest) returns (SetUserActiveResponse);
+  // Admin edit of an app user: change username/email/password and set the
+  // per-field self-edit locks. Admins bypass locks. Enforces per-scope
+  // username/email uniqueness. Empty/unset fields are left unchanged.
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+
+  // Superadmin-only (server enforces Check(platform, caller, admin, app:platform))
+  rpc ListAllOrgs(ListAllOrgsRequest) returns (ListAllOrgsResponse);
+  rpc ListAllApps(ListAllAppsRequest) returns (ListAllAppsResponse);
+  rpc SuspendClient(SuspendClientRequest) returns (SuspendClientResponse);
+  rpc RestoreClient(RestoreClientRequest) returns (RestoreClientResponse);
+  rpc ListDevelopers(ListDevelopersRequest) returns (ListDevelopersResponse);
+  rpc GetPlatformMetrics(GetPlatformMetricsRequest) returns (GetPlatformMetricsResponse);
+}
+
+// A registered application (client). The tenant boundary.
+message App {
+  string client_id = 1;
+  string name = 2;
+  string org_id = 3;
+  string identity_scope = 4; // 'app' | 'org'
+  bool suspended = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // Exact redirect URIs whitelisted for hosted login. Empty = hosted login
+  // disabled.
+  repeated string redirect_uris = 7;
+  // One-click demo login enabled on the hosted login page. The demo account's
+  // email/password are configured via UpdateApp and never returned here.
+  bool demo_enabled = 8;
+  // Login identifier mode: 'username_or_email' (default) | 'email_only' |
+  // 'username_only'. Controls what the hosted login page accepts.
+  string login_identifier = 9;
+  // Public self-serve signup enabled on the hosted login page. When false
+  // (default) the app is invite-only (admins provision accounts).
+  bool public_signup = 10;
+}
+
+message Developer {
+  string developer_id = 1;
+  string email = 2;
+  string org_id = 3;
+  string org_name = 4;
+}
+
+message Org {
+  string org_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
+// One access fact: subject has relation on object (within a client scope).
+message Tuple {
+  string object_type = 1;
+  string object_id = 2;
+  string relation = 3;
+  string subject_type = 4; // 'user' | 'role'
+  string subject_id = 5;
+  string effect = 6;         // 'allow' (default) | 'deny'
+  string condition_expr = 7; // optional ABAC condition, evaluated against the Check context (fails closed)
+}
+
+message RegisterDeveloperRequest {
+  string email = 1;
+  string password = 2;
+  string org_name = 3; // optional; defaults to a name derived from the email
+}
+
+message RegisterDeveloperResponse {
+  bool success = 1;
+  string message = 2;
+  string developer_id = 3;
+  string org_id = 4;
+}
+
+message DeveloperLoginRequest {
+  string email = 1;
+  string password = 2;
+  string user_agent = 3; // optional
+}
+
+message DeveloperLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  Developer developer = 5;
+  bool is_superadmin = 6;
+}
+
+message CreateAppRequest {
+  string access_token = 1;
+  string name = 2;
+  string identity_scope = 3; // 'app' (default) | 'org'
+}
+
+message CreateAppResponse {
+  bool success = 1;
+  string message = 2;
+  App app = 3;
+  string client_secret = 4; // shown once; only a bcrypt hash is stored
+}
+
+message ListAppsRequest {
+  string access_token = 1;
+}
+
+message ListAppsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated App apps = 3;
+}
+
+message UpdateAppRequest {
+  string access_token = 1;
+  string client_id = 2;
+  optional string name = 3;           // unset = unchanged
+  optional string identity_scope = 4; // unset = unchanged
+  // Full replacement hosted-login redirect whitelist, applied only when
+  // set_redirect_uris is true (repeated fields cannot express "unset";
+  // an empty list with the flag set disables hosted login).
+  repeated string redirect_uris = 5;
+  bool set_redirect_uris = 6;
+  optional bool demo_enabled = 7;            // unset = unchanged
+  optional string demo_email = 8;            // demo account email
+  optional string demo_password = 9;         // demo account password (server-side)
+  optional string login_identifier = 10;     // unset = unchanged
+  optional bool public_signup = 11;          // unset = unchanged
+}
+
+message UpdateAppResponse {
+  bool success = 1;
+  string message = 2;
+  App app = 3;
+}
+
+message RotateAppSecretRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message RotateAppSecretResponse {
+  bool success = 1;
+  string message = 2;
+  string client_secret = 3; // shown once; only a bcrypt hash is stored
+}
+
+message DeleteAppRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message DeleteAppResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CheckRequest {
+  string access_token = 1;
+  string subject = 2; // "type:id", e.g. "user:1234"
+  string relation = 3;
+  string object_type = 4;
+  string object_id = 5;
+  map<string, string> context = 6; // ABAC context for tuple conditions (missing keys fail closed)
+  // Tuple scope to evaluate in. Empty defaults to the platform client
+  // (used by the console's superadmin gate). Non-platform scopes require
+  // the calling developer to own the app (or be a superadmin).
+  string client_id = 7;
+  // Machine-to-machine alternative to access_token: when access_token is
+  // empty and client_id + client_secret are valid, the check is authorized
+  // scoped to that client only (it cannot name a different client_id scope).
+  string client_secret = 8;
+}
+
+message CheckResponse {
+  bool allowed = 1;
+  string reason = 2;
+}
+
+message ListObjectsRequest {
+  string access_token = 1;
+  // Tuple scope to evaluate in; same rules as CheckRequest.client_id.
+  string client_id = 2;
+  string subject = 3; // "type:id", e.g. "user:1234"
+  string relation = 4;
+  string object_type = 5;
+}
+
+message ListObjectsResponse {
+  bool success = 1;
+  string message = 2;
+  // Object ids (without the type prefix) of object_type that the subject
+  // can reach for the relation, sorted. Conditions are evaluated with an
+  // EMPTY context: conditioned allow tuples are excluded, and every id
+  // returned passes Check with an empty context.
+  repeated string object_ids = 3;
+}
+
+message DeveloperRefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message DeveloperRefreshTokenResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4; // rotated; the presented token is now invalid
+}
+
+message WriteTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  repeated Tuple tuples = 3;
+}
+
+message WriteTuplesResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  repeated Tuple tuples = 3;
+}
+
+message DeleteTuplesResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// All filter fields are optional; empty means "any".
+message TupleFilter {
+  string object_type = 1;
+  string object_id = 2;
+  string subject_type = 3;
+  string subject_id = 4;
+}
+
+message ListTuplesRequest {
+  string access_token = 1;
+  string client_id = 2;
+  TupleFilter filter = 3;
+  // Machine-to-machine alternative to access_token: when access_token is
+  // empty and client_id + client_secret are valid, the call is authorized
+  // scoped to that client's own tuples only.
+  string client_secret = 4;
+}
+
+message ListTuplesResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Tuple tuples = 3;
+}
+
+message WriteAuthzModelRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string model_json = 3;
+}
+
+message WriteAuthzModelResponse {
+  bool success = 1;
+  string message = 2;
+  int32 version = 3;
+}
+
+message GetAuthzModelRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message GetAuthzModelResponse {
+  bool success = 1;
+  string message = 2;
+  string model_json = 3;
+  int32 version = 4;
+}
+
+// Public (unauthenticated) app info for the hosted login page. The response
+// deliberately carries nothing beyond {success, name, hosted_login_enabled}.
+message GetAppPublicInfoRequest {
+  string client_id = 1;
+}
+
+message GetAppPublicInfoResponse {
+  bool success = 1;
+  string name = 2;
+  bool hosted_login_enabled = 3;
+  // Whether the hosted login page should show the "Login as Demo User" button.
+  bool demo_enabled = 4;
+  // Login identifier mode (see App.login_identifier). Empty defaults to
+  // 'username_or_email'.
+  string login_identifier = 5;
+  // Whether the hosted login page should show the "Sign up" link.
+  bool public_signup = 6;
+}
+
+message HostedLoginRequest {
+  string client_id = 1;
+  string email = 2;
+  string password = 3;
+  // Must EXACTLY equal one of the app's whitelisted redirect_uris (string
+  // equality, no prefix matching).
+  string redirect_uri = 4;
+  string user_agent = 5; // optional
+}
+
+// Same shape as AuthService.GetTokenResponse.
+message HostedLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
+}
+
+// One-click demo login (secret-free). Same response shape as HostedLogin.
+message HostedDemoLoginRequest {
+  string client_id = 1;
+  string redirect_uri = 2; // must EXACTLY match a whitelisted redirect_uri
+  string user_agent = 3;   // optional
+}
+
+message HostedDemoLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
+}
+
+// Public self-serve signup (secret-free). On success the new user is logged
+// in; same response shape as HostedLogin.
+message HostedRegisterRequest {
+  string client_id = 1;
+  string username = 2;
+  string email = 3;
+  string password = 4;
+  string redirect_uri = 5; // must EXACTLY match a whitelisted redirect_uri
+  string user_agent = 6;   // optional
+}
+
+message HostedRegisterResponse {
+  bool success = 1;
+  string message = 2;
+  string access_token = 3;
+  string refresh_token = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  UserProfile user = 6;
+  string session_id = 7;
+}
+
+// Self-edit of the token owner's own profile. Unset fields are unchanged.
+message HostedUpdateProfileRequest {
+  string client_id = 1;
+  string access_token = 2;
+  optional string username = 3;
+  optional string email = 4;
+}
+
+message HostedUpdateProfileResponse {
+  bool success = 1;
+  string message = 2;
+  UserProfile user = 3;
+}
+
+// Admin edit of an app user. Unset fields are left unchanged.
+message UpdateUserRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+  optional string username = 4;
+  optional string email = 5;
+  optional string password = 6;
+  optional bool lock_username = 7;
+  optional bool lock_email = 8;
+  optional bool lock_password = 9;
+}
+
+message UpdateUserResponse {
+  bool success = 1;
+  string message = 2;
+  AppUser user = 3;
+}
+
+// Hosted account page (spec "Hosted account page", added 2026-07-18).
+// Every request carries {client_id, access_token}: the token authenticates
+// the end user, the client_id names the app scope, and the server enforces
+// that they match and that hosted pages are enabled for the app.
+message HostedGetProfileRequest {
+  string client_id = 1;
+  string access_token = 2;
+}
+
+message HostedGetProfileResponse {
+  bool success = 1;
+  string message = 2;
+  UserProfile user = 3;
+  // The token owner's active sessions under this client; `current` marks
+  // the session the presented token belongs to.
+  repeated SessionInfo sessions = 4;
+}
+
+message HostedChangePasswordRequest {
+  string client_id = 1;
+  string access_token = 2;
+  string current_password = 3;
+  string new_password = 4;
+}
+
+message HostedChangePasswordResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HostedRevokeSessionRequest {
+  string client_id = 1;
+  string access_token = 2;
+  string session_id = 3; // must be one of the token owner's own sessions
+}
+
+message HostedRevokeSessionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HostedLogoutAllRequest {
+  string client_id = 1;
+  string access_token = 2;
+}
+
+message HostedLogoutAllResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// One end user of an app, as seen by its developer (never the password).
+message AppUser {
+  string user_id = 1;
+  string username = 2;
+  string email = 3;
+  google.protobuf.Timestamp created_at = 4;
+  bool active = 5;
+  // Active sessions the user holds under THIS client.
+  int32 session_count = 6;
+  // 'app' = the app's own user base; 'org' = the org's shared pool (only
+  // present for org-scoped apps). Deactivating an org user disables the
+  // identity across every app in the org.
+  string scope = 7;
+  // Per-field self-edit locks: when true the user cannot change that field
+  // on their profile page (admins always can).
+  bool lock_username = 8;
+  bool lock_email = 9;
+  bool lock_password = 10;
+}
+
+message ListAppUsersRequest {
+  string access_token = 1;
+  string client_id = 2;
+  // Optional substring match on username OR email.
+  string query = 3;
+}
+
+message ListAppUsersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AppUser users = 3;
+}
+
+message ListUserSessionsAdminRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+}
+
+message ListUserSessionsAdminResponse {
+  bool success = 1;
+  string message = 2;
+  // `current` is always false here (the admin is not the session owner).
+  repeated SessionInfo sessions = 3;
+}
+
+message RevokeUserSessionsAdminRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+}
+
+message RevokeUserSessionsAdminResponse {
+  bool success = 1;
+  string message = 2;
+  int32 revoked_count = 3;
+}
+
+message SetUserActiveRequest {
+  string access_token = 1;
+  string client_id = 2;
+  string user_id = 3;
+  bool active = 4;
+}
+
+message SetUserActiveResponse {
+  bool success = 1;
+  string message = 2;
+  AppUser user = 3;
+}
+
+message ListAllOrgsRequest {
+  string access_token = 1;
+}
+
+message ListAllOrgsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Org orgs = 3;
+}
+
+message ListAllAppsRequest {
+  string access_token = 1;
+}
+
+message ListAllAppsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated App apps = 3;
+}
+
+message SuspendClientRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message SuspendClientResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RestoreClientRequest {
+  string access_token = 1;
+  string client_id = 2;
+}
+
+message RestoreClientResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListDevelopersRequest {
+  string access_token = 1;
+}
+
+message DeveloperInfo {
+  string developer_id = 1;
+  string email = 2;
+  string org_id = 3;
+  string org_name = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message ListDevelopersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated DeveloperInfo developers = 3;
+}
+
+message GetPlatformMetricsRequest {
+  string access_token = 1;
+}
+
+message GetPlatformMetricsResponse {
+  bool success = 1;
+  string message = 2;
+  int64 developers = 3;
+  int64 orgs = 4;
+  int64 apps = 5;
+  int64 users = 6;
+  int64 active_sessions = 7;
+  int64 tuples = 8;
+}
